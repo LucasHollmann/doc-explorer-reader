@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { readTextFile } from "@tauri-apps/plugin-fs";
@@ -11,12 +18,15 @@ import {
   addFavoriteFolder,
   createFavoriteGroup,
   deleteFavoriteGroup,
+  findFavoriteGroup,
   isPathFavorited,
+  moveFavoriteGroup,
   moveFavoriteToGroup,
   removeFavoritePath,
   renameFavoriteGroup,
   sanitizeFavorites,
   type FavoriteEntry,
+  type FavoriteGroup,
 } from "./favorites";
 import "./FileExplorer.css";
 
@@ -29,6 +39,17 @@ type DirEntryInfo = {
   modified: number | null;
 };
 
+type DirectorySummary = {
+  item_count: number;
+  size_bytes: number;
+};
+
+type TreeDirectoryState = {
+  entries?: DirEntryInfo[];
+  loading?: boolean;
+  error?: string;
+};
+
 type ViewMode = "list" | "grid" | "block";
 type TypeFilter = "all" | "folders" | "files";
 type SortKey = "name" | "size" | "created" | "modified" | "type";
@@ -39,6 +60,8 @@ const VIEW_MODES = ["list", "grid", "block"] as const;
 const SORT_KEYS = ["name", "size", "created", "modified", "type"] as const;
 const SORT_DIRS = ["asc", "desc"] as const;
 const GROUP_BYS = ["none", "type"] as const;
+const FAVORITE_FOLDER_DRAG_TYPE = "application/x-doc-explorer-favorite-folder";
+const FAVORITE_GROUP_DRAG_TYPE = "application/x-doc-explorer-favorite-group";
 
 const GROUP_LABEL_KEYS: Record<Category, TranslationKey> = {
   folder: "groupFolders",
@@ -59,6 +82,18 @@ const TEXT_EXTENSIONS = new Set([
   "yml", "yaml", "toml", "rs", "py", "java", "c", "cpp", "h", "sh", "log",
   "csv",
 ]);
+
+function favoriteGroups(entries: FavoriteEntry[]): FavoriteGroup[] {
+  return entries.flatMap((entry) =>
+    entry.type === "group" ? [entry, ...favoriteGroups(entry.items)] : [],
+  );
+}
+
+function descendantGroupIds(group: FavoriteGroup): string[] {
+  return group.items.flatMap((entry) =>
+    entry.type === "group" ? [entry.id, ...descendantGroupIds(entry)] : [],
+  );
+}
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -123,10 +158,18 @@ function FileExplorer() {
   const [entries, setEntries] = useState<DirEntryInfo[]>([]);
   const [selectedFile, setSelectedFile] = useState<DirEntryInfo | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
+  const [directorySummary, setDirectorySummary] = useState<DirectorySummary | null>(null);
+  const [directorySummaryLoading, setDirectorySummaryLoading] = useState(false);
+  const [directorySummaryError, setDirectorySummaryError] = useState<string | null>(null);
+  const directorySummaryRequest = useRef(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(() => new Set());
+  const [treeDirectories, setTreeDirectories] = useState<Record<string, TreeDirectoryState>>({});
 
   const [searchQuery, setSearchQuery] = useState("");
+  const [extensionFilter, setExtensionFilter] = useState("");
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [sortKey, setSortKey] = useState<SortKey>(() =>
     readEnumPreference("sortKey", SORT_KEYS, "name"),
@@ -141,11 +184,14 @@ function FileExplorer() {
     sanitizeFavorites(readStorage<unknown>("favorites", [])),
   );
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
-  const [openGroupId, setOpenGroupId] = useState<string | null>(null);
+  const [openGroupIds, setOpenGroupIds] = useState<Set<string>>(() => new Set());
   const [creatingGroup, setCreatingGroup] = useState(false);
+  const [creatingGroupParentId, setCreatingGroupParentId] = useState<string | null>(null);
   const [newGroupName, setNewGroupName] = useState("");
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null);
+  const [isDraggingFavorite, setIsDraggingFavorite] = useState(false);
 
   useEffect(() => writeStorage("viewMode", viewMode), [viewMode]);
   useEffect(() => writeStorage("sortKey", sortKey), [sortKey]);
@@ -160,7 +206,7 @@ function FileExplorer() {
   }
 
   function favoriteMenuFor(path: string): ContextMenuItem[] {
-    const groups = favorites.filter((entry) => entry.type === "group");
+    const groups = favoriteGroups(favorites);
     const items: ContextMenuItem[] = [
       isPathFavorited(favorites, path)
         ? {
@@ -184,6 +230,46 @@ function FileExplorer() {
     return items;
   }
 
+  function toggleDirectoryTree(path: string) {
+    if (expandedDirectories.has(path)) {
+      setExpandedDirectories((prev) => {
+        const next = new Set(prev);
+        next.delete(path);
+        return next;
+      });
+      return;
+    }
+
+    setExpandedDirectories((prev) => new Set(prev).add(path));
+    const cached = treeDirectories[path];
+    if (cached?.entries || cached?.loading) return;
+
+    setTreeDirectories((prev) => ({ ...prev, [path]: { loading: true } }));
+    void invoke<DirEntryInfo[]>("read_directory", { path })
+      .then((children) => {
+        setTreeDirectories((prev) => ({
+          ...prev,
+          [path]: { entries: children },
+        }));
+      })
+      .catch((cause: unknown) => {
+        setTreeDirectories((prev) => ({
+          ...prev,
+          [path]: { error: String(cause) },
+        }));
+      });
+  }
+
+  function directoryMenuFor(path: string): ContextMenuItem[] {
+    return [
+      ...favoriteMenuFor(path),
+      {
+        label: t(expandedDirectories.has(path) ? "hideFolderContents" : "showFolderContents"),
+        onClick: () => toggleDirectoryTree(path),
+      },
+    ];
+  }
+
   function groupItemMenuFor(path: string): ContextMenuItem[] {
     return [
       {
@@ -203,8 +289,8 @@ function FileExplorer() {
       {
         label: t("renameGroup"),
         onClick: () => {
-          const group = favorites.find((e) => e.id === groupId);
-          if (group?.type === "group") {
+          const group = findFavoriteGroup(favorites, groupId);
+          if (group) {
             setRenamingGroupId(groupId);
             setRenameValue(group.name);
           }
@@ -218,12 +304,26 @@ function FileExplorer() {
     ];
   }
 
+  function newGroupMenuItem(parentGroupId: string | null): ContextMenuItem {
+    return {
+      label: t("newGroup"),
+      onClick: () => {
+        if (parentGroupId !== null) {
+          setOpenGroupIds((prev) => new Set(prev).add(parentGroupId));
+        }
+        setCreatingGroupParentId(parentGroupId);
+        setCreatingGroup(true);
+      },
+    };
+  }
+
   function commitNewGroup() {
     const trimmed = newGroupName.trim();
     if (trimmed) {
-      setFavorites((prev) => createFavoriteGroup(prev, trimmed));
+      setFavorites((prev) => createFavoriteGroup(prev, trimmed, creatingGroupParentId));
     }
     setCreatingGroup(false);
+    setCreatingGroupParentId(null);
     setNewGroupName("");
   }
 
@@ -243,10 +343,14 @@ function FileExplorer() {
   }, [error]);
 
   async function loadDirectory(path: string, options?: { silent?: boolean }) {
+    directorySummaryRequest.current += 1;
     setLoading(true);
     if (!options?.silent) setError(null);
     setSelectedFile(null);
     setFileContent(null);
+    setDirectorySummary(null);
+    setDirectorySummaryLoading(false);
+    setDirectorySummaryError(null);
     try {
       const result = await invoke<DirEntryInfo[]>("read_directory", { path });
       setEntries(result);
@@ -282,13 +386,40 @@ function FileExplorer() {
 
   async function openEntry(entry: DirEntryInfo) {
     if (entry.is_dir) {
-      await loadDirectory(entry.path);
+      directorySummaryRequest.current += 1;
+      const requestId = directorySummaryRequest.current;
+      setSelectedFile(entry);
+      setFileContent(null);
+      setError(null);
+      setDirectorySummary(null);
+      setDirectorySummaryLoading(true);
+      setDirectorySummaryError(null);
+      try {
+        const summary = await invoke<DirectorySummary>("directory_summary", {
+          path: entry.path,
+        });
+        if (directorySummaryRequest.current === requestId) {
+          setDirectorySummary(summary);
+        }
+      } catch (cause) {
+        if (directorySummaryRequest.current === requestId) {
+          setDirectorySummaryError(String(cause));
+        }
+      } finally {
+        if (directorySummaryRequest.current === requestId) {
+          setDirectorySummaryLoading(false);
+        }
+      }
       return;
     }
 
+    directorySummaryRequest.current += 1;
     setSelectedFile(entry);
     setFileContent(null);
     setError(null);
+    setDirectorySummary(null);
+    setDirectorySummaryLoading(false);
+    setDirectorySummaryError(null);
 
     const ext = extensionOf(entry.name);
     if (!TEXT_EXTENSIONS.has(ext)) {
@@ -316,14 +447,16 @@ function FileExplorer() {
 
   const processedEntries = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
+    const extension = extensionFilter.trim().replace(/^\.+/, "").toLowerCase();
     const filtered = entries.filter((entry) => {
       if (typeFilter === "folders" && !entry.is_dir) return false;
       if (typeFilter === "files" && entry.is_dir) return false;
       if (query && !entry.name.toLowerCase().includes(query)) return false;
+      if (extension && (entry.is_dir || extensionOf(entry.name) !== extension)) return false;
       return true;
     });
     return [...filtered].sort((a, b) => compareEntries(a, b, sortKey, sortDir));
-  }, [entries, searchQuery, typeFilter, sortKey, sortDir]);
+  }, [entries, searchQuery, extensionFilter, typeFilter, sortKey, sortDir]);
 
   const groupedEntries = useMemo(() => {
     if (groupBy !== "type") return [];
@@ -339,32 +472,302 @@ function FileExplorer() {
     }));
   }, [processedEntries, groupBy]);
 
+  function startDraggingFolder(e: ReactDragEvent, path: string) {
+    e.dataTransfer.setData(FAVORITE_FOLDER_DRAG_TYPE, path);
+    e.dataTransfer.effectAllowed = "move";
+    setIsDraggingFavorite(true);
+  }
+
+  function startDraggingGroup(e: ReactDragEvent, groupId: string) {
+    e.dataTransfer.setData(FAVORITE_GROUP_DRAG_TYPE, groupId);
+    e.dataTransfer.effectAllowed = "move";
+    setIsDraggingFavorite(true);
+  }
+
+  function endDraggingFavorite() {
+    setDropTargetGroupId(null);
+    setIsDraggingFavorite(false);
+  }
+
+  function handleGroupDragOver(e: ReactDragEvent, groupId: string) {
+    if (
+      !e.dataTransfer.types.includes(FAVORITE_FOLDER_DRAG_TYPE) &&
+      !e.dataTransfer.types.includes(FAVORITE_GROUP_DRAG_TYPE)
+    ) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "move";
+    setDropTargetGroupId(groupId);
+  }
+
+  function handleGroupDrop(e: ReactDragEvent, groupId: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    const path = e.dataTransfer.getData(FAVORITE_FOLDER_DRAG_TYPE);
+    const draggedGroupId = e.dataTransfer.getData(FAVORITE_GROUP_DRAG_TYPE);
+    if (path) {
+      setFavorites((prev) => moveFavoriteToGroup(prev, path, groupId));
+    } else if (draggedGroupId) {
+      setFavorites((prev) => moveFavoriteGroup(prev, draggedGroupId, groupId));
+    }
+    setDropTargetGroupId(null);
+    setIsDraggingFavorite(false);
+  }
+
+  function handleFavoritesBarDrop(e: ReactDragEvent) {
+    if (e.target !== e.currentTarget) return;
+    e.preventDefault();
+    const path = e.dataTransfer.getData(FAVORITE_FOLDER_DRAG_TYPE);
+    const draggedGroupId = e.dataTransfer.getData(FAVORITE_GROUP_DRAG_TYPE);
+    if (path) {
+      setFavorites((prev) => moveFavoriteToGroup(prev, path, null));
+    } else if (draggedGroupId) {
+      setFavorites((prev) => moveFavoriteGroup(prev, draggedGroupId, null));
+    }
+    setDropTargetGroupId(null);
+    setIsDraggingFavorite(false);
+  }
+
+  function toggleFavoriteGroup(group: FavoriteGroup) {
+    setOpenGroupIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(group.id)) {
+        next.delete(group.id);
+        for (const descendantId of descendantGroupIds(group)) next.delete(descendantId);
+      } else {
+        next.add(group.id);
+      }
+      return next;
+    });
+  }
+
+  function renderNewGroupInput() {
+    return (
+      <input
+        autoFocus
+        className="group-name-input"
+        placeholder={t("newGroup")}
+        value={newGroupName}
+        onChange={(e) => setNewGroupName(e.currentTarget.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commitNewGroup();
+          if (e.key === "Escape") {
+            setCreatingGroup(false);
+            setCreatingGroupParentId(null);
+            setNewGroupName("");
+          }
+        }}
+        onBlur={commitNewGroup}
+      />
+    );
+  }
+
+  function renderFavoriteGroup(
+    group: FavoriteGroup,
+    parentGroupId: string | null,
+  ) {
+    const isOpen = openGroupIds.has(group.id);
+    const isRoot = parentGroupId === null;
+    return (
+      <div
+        className={`favorite-group${dropTargetGroupId === group.id ? " drop-target" : ""}`}
+        key={group.id}
+        onDragOver={(e) => handleGroupDragOver(e, group.id)}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+            setDropTargetGroupId(null);
+          }
+        }}
+        onDrop={(e) => handleGroupDrop(e, group.id)}
+      >
+        {renamingGroupId === group.id ? (
+          <input
+            autoFocus
+            className="group-name-input"
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitGroupRename();
+              if (e.key === "Escape") {
+                setRenamingGroupId(null);
+                setRenameValue("");
+              }
+            }}
+            onBlur={commitGroupRename}
+          />
+        ) : (
+          <button
+            className="favorite-chip group-chip"
+            draggable
+            onDragStart={(e) => startDraggingGroup(e, group.id)}
+            onDragEnd={endDraggingFavorite}
+            onClick={() => toggleFavoriteGroup(group)}
+            onContextMenu={(e) =>
+              openContextMenu(e, [...groupMenuFor(group.id), newGroupMenuItem(group.id)])
+            }
+          >
+            📁 {group.name}
+          </button>
+        )}
+
+        {isRoot && isOpen && !isDraggingFavorite && (
+          <div
+            className="favorite-dropdown-overlay"
+            onClick={() => setOpenGroupIds(new Set())}
+          />
+        )}
+        {isOpen && (
+          <div
+            className={`favorite-dropdown${isRoot ? "" : " nested-dropdown"}`}
+            onContextMenu={(e) => openContextMenu(e, [newGroupMenuItem(group.id)])}
+          >
+            {group.items.length === 0 && creatingGroupParentId !== group.id && (
+              <p className="hint">{t("emptyGroup")}</p>
+            )}
+            {group.items.map((item) =>
+              item.type === "folder" ? (
+                <button
+                  key={item.id}
+                  className="favorite-dropdown-item"
+                  title={item.path}
+                  draggable
+                  onDragStart={(e) => startDraggingFolder(e, item.path)}
+                  onDragEnd={endDraggingFavorite}
+                  onClick={() => {
+                    loadDirectory(item.path);
+                    setOpenGroupIds(new Set());
+                  }}
+                  onContextMenu={(e) =>
+                    openContextMenu(e, [
+                      ...groupItemMenuFor(item.path),
+                      newGroupMenuItem(group.id),
+                    ])
+                  }
+                >
+                  {basenameOf(item.path)}
+                </button>
+              ) : (
+                renderFavoriteGroup(item, group.id)
+              ),
+            )}
+            {creatingGroup && creatingGroupParentId === group.id && renderNewGroupInput()}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   function renderEntryList(list: DirEntryInfo[]) {
     return (
       <ul>
-        {list.map((entry) => (
-          <li
-            key={entry.path}
-            className={selectedFile?.path === entry.path ? "selected" : ""}
-            onClick={() => openEntry(entry)}
-            onContextMenu={(e) => {
-              if (entry.is_dir) openContextMenu(e, favoriteMenuFor(entry.path));
-            }}
-            title={entry.name}
-          >
-            <span className="icon">{iconFor(entry.is_dir, extensionOf(entry.name))}</span>
-            <span className="name">{entry.name}</span>
-            {viewMode === "list" && (
-              <>
-                {!entry.is_dir && (
-                  <span className="meta">{formatSize(entry.size)}</span>
-                )}
-                <span className="meta">{formatDate(entry.modified)}</span>
-              </>
-            )}
-          </li>
-        ))}
+        {list.map((entry) => renderTreeEntry(entry))}
       </ul>
+    );
+  }
+
+  function renderTreeEntry(entry: DirEntryInfo, depth = 0) {
+    const expanded = expandedDirectories.has(entry.path);
+    const treeState = treeDirectories[entry.path];
+    const blockView = viewMode === "block";
+    return (
+      <li
+        className={`tree-node${blockView && depth === 0 && entry.is_dir && expanded ? " expanded-tree-node" : ""}`}
+        key={entry.path}
+      >
+        <div
+          className={`tree-entry-row${blockView && depth === 0 && !expanded ? " tree-block-tile" : ""}${blockView && (expanded || depth > 0) ? " tree-compact-row" : ""}${selectedFile?.path === entry.path ? " selected" : ""}`}
+          draggable={entry.is_dir}
+          onDragStart={(e) => startDraggingFolder(e, entry.path)}
+          onDragEnd={endDraggingFavorite}
+          onClick={() => openEntry(entry)}
+          onDoubleClick={() => {
+            if (entry.is_dir) void loadDirectory(entry.path);
+          }}
+          onContextMenu={(e) => {
+            if (entry.is_dir) openContextMenu(e, directoryMenuFor(entry.path));
+          }}
+          title={entry.path}
+        >
+          {entry.is_dir ? (
+            <button
+              className="tree-toggle"
+              aria-label={t(expanded ? "hideFolderContents" : "showFolderContents")}
+              aria-expanded={expanded}
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleDirectoryTree(entry.path);
+              }}
+            >
+              {expanded ? "▾" : "▸"}
+            </button>
+          ) : (
+            <span className="tree-toggle-spacer" />
+          )}
+          <span className="icon">{iconFor(entry.is_dir, extensionOf(entry.name))}</span>
+          <span className="name">{entry.name}</span>
+          {viewMode === "list" && (
+            <>
+              {!entry.is_dir && <span className="meta">{formatSize(entry.size)}</span>}
+              <span className="meta">{formatDate(entry.modified)}</span>
+            </>
+          )}
+        </div>
+        {entry.is_dir && expanded && (
+          <div className={viewMode === "block" ? "tree-contents" : undefined}>
+            <ul className="tree-children">
+              {treeState?.loading && <li className="tree-message hint">{t("loading")}</li>}
+              {treeState?.error && (
+                <li className="tree-message error">{treeState.error}</li>
+              )}
+              {treeState?.entries?.length === 0 && (
+                <li className="tree-message hint">{t("emptyFolder")}</li>
+              )}
+              {treeState?.entries?.map((child) => renderTreeEntry(child, depth + 1))}
+            </ul>
+          </div>
+        )}
+      </li>
+    );
+  }
+
+  function renderSelectedPreview() {
+    if (!selectedFile) return null;
+
+    if (selectedFile.is_dir) {
+      return (
+        <>
+          <h3>{selectedFile.name}</h3>
+          {directorySummaryLoading && <p className="hint">{t("folderSummaryLoading")}</p>}
+          {directorySummaryError && (
+            <p className="error">
+              {t("folderSummaryError").replace("{error}", directorySummaryError)}
+            </p>
+          )}
+          {directorySummary && (
+            <dl className="folder-summary">
+              <dt>{t("folderItemCount")}</dt>
+              <dd>{directorySummary.item_count.toLocaleString(language === "pt" ? "pt-BR" : "en-US")}</dd>
+              <dt>{t("folderTotalSize")}</dt>
+              <dd>
+                {directorySummary.size_bytes.toLocaleString(language === "pt" ? "pt-BR" : "en-US")} bytes
+              </dd>
+            </dl>
+          )}
+        </>
+      );
+    }
+
+    return (
+      <>
+        <h3>{selectedFile.name}</h3>
+        {fileContent !== null ? (
+          <pre>{fileContent}</pre>
+        ) : (
+          <p className="hint">{t("noPreviewHint")}</p>
+        )}
+      </>
     );
   }
 
@@ -458,147 +861,123 @@ function FileExplorer() {
         </div>
       </header>
 
-      <div className="favorites-bar">
+      <div
+        className="favorites-bar"
+        onContextMenu={(e) => openContextMenu(e, [newGroupMenuItem(null)])}
+        onDragOver={(e) => {
+          if (
+            e.dataTransfer.types.includes(FAVORITE_FOLDER_DRAG_TYPE) ||
+            e.dataTransfer.types.includes(FAVORITE_GROUP_DRAG_TYPE)
+          ) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+          }
+        }}
+        onDrop={handleFavoritesBarDrop}
+      >
         {favorites.map((entry) =>
           entry.type === "folder" ? (
             <button
               key={entry.id}
               className="favorite-chip"
               title={entry.path}
+              draggable
+              onDragStart={(e) => startDraggingFolder(e, entry.path)}
+              onDragEnd={endDraggingFavorite}
               onClick={() => loadDirectory(entry.path)}
-              onContextMenu={(e) => openContextMenu(e, favoriteMenuFor(entry.path))}
+              onContextMenu={(e) =>
+                openContextMenu(e, [...favoriteMenuFor(entry.path), newGroupMenuItem(null)])
+              }
             >
               <span className="favorite-name">{basenameOf(entry.path)}</span>
             </button>
           ) : (
-            <div className="favorite-group" key={entry.id}>
-              {renamingGroupId === entry.id ? (
-                <input
-                  autoFocus
-                  className="group-name-input"
-                  value={renameValue}
-                  onChange={(e) => setRenameValue(e.currentTarget.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") commitGroupRename();
-                    if (e.key === "Escape") {
-                      setRenamingGroupId(null);
-                      setRenameValue("");
-                    }
-                  }}
-                  onBlur={commitGroupRename}
-                />
-              ) : (
-                <button
-                  className="favorite-chip group-chip"
-                  onClick={() => setOpenGroupId(openGroupId === entry.id ? null : entry.id)}
-                  onContextMenu={(e) => openContextMenu(e, groupMenuFor(entry.id))}
-                >
-                  📁 {entry.name}
-                </button>
-              )}
-
-              {openGroupId === entry.id && (
-                <>
-                  <div className="favorite-dropdown-overlay" onClick={() => setOpenGroupId(null)} />
-                  <div className="favorite-dropdown">
-                    {entry.items.length === 0 && <p className="hint">{t("emptyGroup")}</p>}
-                    {entry.items.map((item) => (
-                      <button
-                        key={item.id}
-                        className="favorite-dropdown-item"
-                        title={item.path}
-                        onClick={() => {
-                          loadDirectory(item.path);
-                          setOpenGroupId(null);
-                        }}
-                        onContextMenu={(e) => openContextMenu(e, groupItemMenuFor(item.path))}
-                      >
-                        {basenameOf(item.path)}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
+            renderFavoriteGroup(entry, null)
           ),
         )}
 
-        {creatingGroup ? (
-          <input
-            autoFocus
-            className="group-name-input"
-            placeholder={t("newGroup")}
-            value={newGroupName}
-            onChange={(e) => setNewGroupName(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") commitNewGroup();
-              if (e.key === "Escape") {
-                setCreatingGroup(false);
-                setNewGroupName("");
-              }
-            }}
-            onBlur={commitNewGroup}
-          />
-        ) : (
-          <button className="icon-btn" title={t("newGroup")} onClick={() => setCreatingGroup(true)}>
-            +
-          </button>
-        )}
+        {creatingGroup && creatingGroupParentId === null && renderNewGroupInput()}
       </div>
 
       {currentPath && (
         <div className="controls">
-          <input
-            type="text"
-            className="search-input"
-            placeholder={t("searchPlaceholder")}
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.currentTarget.value)}
-          />
+          <div className="controls-main">
+            <input
+              type="text"
+              className="search-input"
+              placeholder={t("searchPlaceholder")}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.currentTarget.value)}
+            />
 
-          <label className="control">
-            <span className="control-label">{t("filterLabel")}</span>
-            <select
-              value={typeFilter}
-              onChange={(e) => setTypeFilter(e.currentTarget.value as TypeFilter)}
-            >
-              <option value="all">{t("filterAll")}</option>
-              <option value="folders">{t("filterFolders")}</option>
-              <option value="files">{t("filterFiles")}</option>
-            </select>
-          </label>
-
-          <label className="control">
-            <span className="control-label">{t("sortLabel")}</span>
-            <select
-              value={sortKey}
-              onChange={(e) => setSortKey(e.currentTarget.value as SortKey)}
-            >
-              <option value="name">{t("sortName")}</option>
-              <option value="size">{t("sortSize")}</option>
-              <option value="created">{t("sortCreated")}</option>
-              <option value="modified">{t("sortModified")}</option>
-              <option value="type">{t("sortType")}</option>
-            </select>
             <button
-              className="sort-dir"
-              title={sortDir === "asc" ? t("sortAscending") : t("sortDescending")}
-              onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+              className={`advanced-filters-toggle${advancedFiltersOpen ? " active" : ""}`}
+              aria-expanded={advancedFiltersOpen}
+              aria-controls="advanced-filters-panel"
+              onClick={() => setAdvancedFiltersOpen((open) => !open)}
             >
-              {sortDir === "asc" ? "↑" : "↓"}
+              {t("advancedFilters")}
+              <span aria-hidden="true">{advancedFiltersOpen ? "▴" : "▾"}</span>
             </button>
-          </label>
 
-          <label className="control">
-            <span className="control-label">{t("groupLabel")}</span>
-            <select
-              value={groupBy}
-              onChange={(e) => setGroupBy(e.currentTarget.value as GroupBy)}
-            >
-              <option value="none">{t("groupNone")}</option>
-              <option value="type">{t("groupByType")}</option>
-            </select>
-          </label>
+            <label className="control">
+              <span className="control-label">{t("sortLabel")}</span>
+              <select
+                value={sortKey}
+                onChange={(e) => setSortKey(e.currentTarget.value as SortKey)}
+              >
+                <option value="name">{t("sortName")}</option>
+                <option value="size">{t("sortSize")}</option>
+                <option value="created">{t("sortCreated")}</option>
+                <option value="modified">{t("sortModified")}</option>
+                <option value="type">{t("sortType")}</option>
+              </select>
+              <button
+                className="sort-dir"
+                title={sortDir === "asc" ? t("sortAscending") : t("sortDescending")}
+                onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+              >
+                {sortDir === "asc" ? "↑" : "↓"}
+              </button>
+            </label>
+
+            <label className="control">
+              <span className="control-label">{t("groupLabel")}</span>
+              <select
+                value={groupBy}
+                onChange={(e) => setGroupBy(e.currentTarget.value as GroupBy)}
+              >
+                <option value="none">{t("groupNone")}</option>
+                <option value="type">{t("groupByType")}</option>
+              </select>
+            </label>
+          </div>
+
+          {advancedFiltersOpen && (
+            <div className="advanced-filters-panel" id="advanced-filters-panel">
+              <label className="control">
+                <span className="control-label">{t("filterLabel")}</span>
+                <select
+                  value={typeFilter}
+                  onChange={(e) => setTypeFilter(e.currentTarget.value as TypeFilter)}
+                >
+                  <option value="all">{t("filterAll")}</option>
+                  <option value="folders">{t("filterFolders")}</option>
+                  <option value="files">{t("filterFiles")}</option>
+                </select>
+              </label>
+              <label className="control">
+                <span className="control-label">{t("extensionLabel")}</span>
+                <input
+                  className="extension-filter-input"
+                  type="text"
+                  value={extensionFilter}
+                  placeholder="pdf"
+                  onChange={(e) => setExtensionFilter(e.currentTarget.value)}
+                />
+              </label>
+            </div>
+          )}
         </div>
       )}
 
@@ -629,16 +1008,7 @@ function FileExplorer() {
         {viewMode === "list" && (
           <div className="preview">
             {!selectedFile && <p className="hint">{t("selectFileHint")}</p>}
-            {selectedFile && (
-              <>
-                <h3>{selectedFile.name}</h3>
-                {fileContent !== null ? (
-                  <pre>{fileContent}</pre>
-                ) : (
-                  <p className="hint">{t("noPreviewHint")}</p>
-                )}
-              </>
-            )}
+            {renderSelectedPreview()}
           </div>
         )}
       </div>
@@ -647,17 +1017,15 @@ function FileExplorer() {
         <div className="preview-overlay">
           <button
             className="overlay-close"
-            onClick={() => setSelectedFile(null)}
+            onClick={() => {
+              directorySummaryRequest.current += 1;
+              setSelectedFile(null);
+            }}
             aria-label="Close preview"
           >
             ×
           </button>
-          <h3>{selectedFile.name}</h3>
-          {fileContent !== null ? (
-            <pre>{fileContent}</pre>
-          ) : (
-            <p className="hint">{t("noPreviewHint")}</p>
-          )}
+          {renderSelectedPreview()}
         </div>
       )}
 
