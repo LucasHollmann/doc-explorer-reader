@@ -5,15 +5,18 @@ import {
   useState,
   type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { readTextFile } from "@tauri-apps/plugin-fs";
+import { readFile, readTextFile } from "@tauri-apps/plugin-fs";
 import { useLanguage } from "../i18n/LanguageContext";
 import type { TranslationKey } from "../i18n/translations";
 import { readEnumPreference, readStorage, writeStorage } from "../storage/localStorage";
 import { CATEGORY_ORDER, categoryOf, iconFor, type Category } from "./fileCategories";
 import ContextMenu, { type ContextMenuItem, type ContextMenuState } from "./ContextMenu";
+import { getLastOpened, recordLastOpened } from "./lastOpened";
+import { getMediaProgress, setMediaProgress } from "./mediaProgress";
 import {
   addFavoriteFolder,
   createFavoriteGroup,
@@ -83,6 +86,24 @@ const TEXT_EXTENSIONS = new Set([
   "csv",
 ]);
 
+const AUDIO_MIME_TYPES: Record<string, string> = {
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  flac: "audio/flac",
+  ogg: "audio/ogg",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+};
+
+const VIDEO_MIME_TYPES: Record<string, string> = {
+  mp4: "video/mp4",
+  mkv: "video/x-matroska",
+  avi: "video/x-msvideo",
+  mov: "video/quicktime",
+  webm: "video/webm",
+  flv: "video/x-flv",
+};
+
 function favoriteGroups(entries: FavoriteEntry[]): FavoriteGroup[] {
   return entries.flatMap((entry) =>
     entry.type === "group" ? [entry, ...favoriteGroups(entry.items)] : [],
@@ -112,9 +133,22 @@ function formatDate(epochSeconds: number | null): string {
   return new Date(epochSeconds * 1000).toLocaleString();
 }
 
+function formatSeconds(totalSeconds: number): string {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
 function extensionOf(name: string): string {
   const idx = name.lastIndexOf(".");
   return idx === -1 ? "" : name.slice(idx + 1).toLowerCase();
+}
+
+function canPreviewEntry(entry: DirEntryInfo): boolean {
+  if (entry.is_dir) return false;
+  const ext = extensionOf(entry.name);
+  const category = categoryOf(false, ext);
+  return ext === "pdf" || category === "audio" || category === "video" || TEXT_EXTENSIONS.has(ext);
 }
 
 function basenameOf(path: string): string {
@@ -158,6 +192,21 @@ function FileExplorer() {
   const [entries, setEntries] = useState<DirEntryInfo[]>([]);
   const [selectedFile, setSelectedFile] = useState<DirEntryInfo | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
+  const [pdfPreviewUrl, setPdfPreviewUrl] = useState<string | null>(null);
+  const pdfPreviewUrlRef = useRef<string | null>(null);
+  const [previewFullscreen, setPreviewFullscreen] = useState(false);
+  const [audioPreviewUrl, setAudioPreviewUrl] = useState<string | null>(null);
+  const audioPreviewUrlRef = useRef<string | null>(null);
+  const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
+  const videoPreviewUrlRef = useRef<string | null>(null);
+  const mediaElRef = useRef<HTMLMediaElement | null>(null);
+  const progressTrackingArmedRef = useRef(false);
+  const pendingResumeSecondsRef = useRef<number | null>(null);
+  const [resumePrompt, setResumePrompt] = useState<{ filePath: string; seconds: number } | null>(
+    null,
+  );
+  const [fullscreenPanelWidth, setFullscreenPanelWidth] = useState(300);
+  const [panelResizing, setPanelResizing] = useState(false);
   const [directorySummary, setDirectorySummary] = useState<DirectorySummary | null>(null);
   const [directorySummaryLoading, setDirectorySummaryLoading] = useState(false);
   const [directorySummaryError, setDirectorySummaryError] = useState<string | null>(null);
@@ -384,12 +433,136 @@ function FileExplorer() {
     }
   }
 
+  function clearPdfPreview() {
+    if (pdfPreviewUrlRef.current) {
+      URL.revokeObjectURL(pdfPreviewUrlRef.current);
+      pdfPreviewUrlRef.current = null;
+    }
+    setPdfPreviewUrl(null);
+  }
+
+  function clearAudioPreview() {
+    if (audioPreviewUrlRef.current) {
+      URL.revokeObjectURL(audioPreviewUrlRef.current);
+      audioPreviewUrlRef.current = null;
+    }
+    setAudioPreviewUrl(null);
+  }
+
+  function clearVideoPreview() {
+    if (videoPreviewUrlRef.current) {
+      URL.revokeObjectURL(videoPreviewUrlRef.current);
+      videoPreviewUrlRef.current = null;
+    }
+    setVideoPreviewUrl(null);
+  }
+
+  useEffect(() => {
+    return () => {
+      if (pdfPreviewUrlRef.current) {
+        URL.revokeObjectURL(pdfPreviewUrlRef.current);
+      }
+      if (audioPreviewUrlRef.current) {
+        URL.revokeObjectURL(audioPreviewUrlRef.current);
+      }
+      if (videoPreviewUrlRef.current) {
+        URL.revokeObjectURL(videoPreviewUrlRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!previewFullscreen || !selectedFile || (!audioPreviewUrl && !videoPreviewUrl)) return;
+    const filePath = selectedFile.path;
+    const interval = setInterval(() => {
+      if (!progressTrackingArmedRef.current) return;
+      const el = mediaElRef.current;
+      if (!el) return;
+      setMediaProgress(filePath, Math.floor(el.currentTime));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [previewFullscreen, selectedFile, audioPreviewUrl, videoPreviewUrl]);
+
+  function setMediaRef(el: HTMLMediaElement | null) {
+    mediaElRef.current = el;
+    if (el && pendingResumeSecondsRef.current !== null) {
+      el.currentTime = pendingResumeSecondsRef.current;
+      pendingResumeSecondsRef.current = null;
+    }
+  }
+
+  function handleMediaLoadedMetadata(event: { currentTarget: HTMLMediaElement }) {
+    if (pendingResumeSecondsRef.current !== null) {
+      event.currentTarget.currentTime = pendingResumeSecondsRef.current;
+      pendingResumeSecondsRef.current = null;
+    }
+  }
+
+  function enterFullscreenView(filePath: string, isMedia: boolean) {
+    recordLastOpened(filePath);
+    setPreviewFullscreen(true);
+    if (isMedia) {
+      const stored = getMediaProgress(filePath);
+      if (stored > 0) {
+        progressTrackingArmedRef.current = false;
+        setResumePrompt({ filePath, seconds: stored });
+        return;
+      }
+    }
+    progressTrackingArmedRef.current = true;
+    setResumePrompt(null);
+  }
+
+  function answerResumePrompt(resume: boolean) {
+    if (!resumePrompt) return;
+    if (resume) {
+      const el = mediaElRef.current;
+      if (el) {
+        el.currentTime = resumePrompt.seconds;
+      } else {
+        pendingResumeSecondsRef.current = resumePrompt.seconds;
+      }
+    }
+    progressTrackingArmedRef.current = true;
+    setResumePrompt(null);
+  }
+
+  async function openEntryInView(entry: DirEntryInfo) {
+    const ext = extensionOf(entry.name);
+    const category = categoryOf(false, ext);
+    enterFullscreenView(entry.path, category === "audio" || category === "video");
+    await openEntry(entry);
+  }
+
+  function handlePanelResizeStart(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setPanelResizing(true);
+  }
+
+  function handlePanelResizeMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.buttons === 0) return;
+    const width = window.innerWidth - event.clientX;
+    setFullscreenPanelWidth(Math.min(600, Math.max(220, width)));
+  }
+
+  function handlePanelResizeEnd(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setPanelResizing(false);
+  }
+
   async function openEntry(entry: DirEntryInfo) {
     if (entry.is_dir) {
       directorySummaryRequest.current += 1;
       const requestId = directorySummaryRequest.current;
       setSelectedFile(entry);
       setFileContent(null);
+      clearPdfPreview();
+      clearAudioPreview();
+      clearVideoPreview();
+      setPreviewFullscreen(false);
       setError(null);
       setDirectorySummary(null);
       setDirectorySummaryLoading(true);
@@ -416,12 +589,59 @@ function FileExplorer() {
     directorySummaryRequest.current += 1;
     setSelectedFile(entry);
     setFileContent(null);
+    const ext = extensionOf(entry.name);
+    const category = categoryOf(false, ext);
+    clearPdfPreview();
+    clearAudioPreview();
+    clearVideoPreview();
+    if (!canPreviewEntry(entry)) {
+      setPreviewFullscreen(false);
+      setResumePrompt(null);
+    }
     setError(null);
     setDirectorySummary(null);
     setDirectorySummaryLoading(false);
     setDirectorySummaryError(null);
 
-    const ext = extensionOf(entry.name);
+    if (ext === "pdf") {
+      try {
+        const bytes = await readFile(entry.path);
+        const blob = new Blob([bytes], { type: "application/pdf" });
+        const url = URL.createObjectURL(blob);
+        pdfPreviewUrlRef.current = url;
+        setPdfPreviewUrl(url);
+      } catch (e) {
+        setError(String(e));
+      }
+      return;
+    }
+
+    if (category === "audio") {
+      try {
+        const bytes = await readFile(entry.path);
+        const blob = new Blob([bytes], { type: AUDIO_MIME_TYPES[ext] ?? "audio/mpeg" });
+        const url = URL.createObjectURL(blob);
+        audioPreviewUrlRef.current = url;
+        setAudioPreviewUrl(url);
+      } catch (e) {
+        setError(String(e));
+      }
+      return;
+    }
+
+    if (category === "video") {
+      try {
+        const bytes = await readFile(entry.path);
+        const blob = new Blob([bytes], { type: VIDEO_MIME_TYPES[ext] ?? "video/mp4" });
+        const url = URL.createObjectURL(blob);
+        videoPreviewUrlRef.current = url;
+        setVideoPreviewUrl(url);
+      } catch (e) {
+        setError(String(e));
+      }
+      return;
+    }
+
     if (!TEXT_EXTENSIONS.has(ext)) {
       setFileContent(null);
       return;
@@ -667,6 +887,31 @@ function FileExplorer() {
     );
   }
 
+  function renderFileListContents() {
+    return (
+      <>
+        {loading && <p className="hint">{t("loading")}</p>}
+        {!loading && currentPath && entries.length > 0 && processedEntries.length === 0 && (
+          <p className="hint">{t("noResults")}</p>
+        )}
+        {!loading && currentPath && entries.length === 0 && (
+          <p className="hint">{t("emptyFolder")}</p>
+        )}
+
+        {groupBy === "none"
+          ? renderEntryList(processedEntries)
+          : groupedEntries.map(({ category, items }) => (
+              <div className="group" key={category}>
+                <h4 className="group-header">
+                  {t(GROUP_LABEL_KEYS[category])} ({items.length})
+                </h4>
+                {renderEntryList(items)}
+              </div>
+            ))}
+      </>
+    );
+  }
+
   function renderTreeEntry(entry: DirEntryInfo, depth = 0) {
     const expanded = expandedDirectories.has(entry.path);
     const treeState = treeDirectories[entry.path];
@@ -683,7 +928,11 @@ function FileExplorer() {
           onDragEnd={endDraggingFavorite}
           onClick={() => openEntry(entry)}
           onDoubleClick={() => {
-            if (entry.is_dir) void loadDirectory(entry.path);
+            if (entry.is_dir) {
+              void loadDirectory(entry.path);
+            } else if (canPreviewEntry(entry)) {
+              void openEntryInView(entry);
+            }
           }}
           onContextMenu={(e) => {
             if (entry.is_dir) openContextMenu(e, directoryMenuFor(entry.path));
@@ -709,8 +958,9 @@ function FileExplorer() {
           <span className="name">{entry.name}</span>
           {viewMode === "list" && (
             <>
-              {!entry.is_dir && <span className="meta">{formatSize(entry.size)}</span>}
-              <span className="meta">{formatDate(entry.modified)}</span>
+              <span className="meta meta-size">{!entry.is_dir ? formatSize(entry.size) : ""}</span>
+              <span className="meta meta-date">{formatDate(entry.modified)}</span>
+              <span className="meta meta-date">{formatDate(getLastOpened(entry.path))}</span>
             </>
           )}
         </div>
@@ -759,16 +1009,126 @@ function FileExplorer() {
       );
     }
 
+    if (pdfPreviewUrl) {
+      return (
+        <>
+          <div className="preview-pane">
+            <div className="preview-toolbar">
+              <button
+                type="button"
+                onClick={() => enterFullscreenView(selectedFile.path, false)}
+              >
+                {t("viewFile")}
+              </button>
+            </div>
+            <embed
+              className="pdf-preview"
+              src={`${pdfPreviewUrl}#toolbar=0&navpanes=0&scrollbar=0`}
+              type="application/pdf"
+            />
+          </div>
+        </>
+      );
+    }
+
+    if (audioPreviewUrl) {
+      return (
+        <>
+          <h3>{selectedFile.name}</h3>
+          <div className="preview-toolbar">
+            <button
+              type="button"
+              onClick={() => enterFullscreenView(selectedFile.path, true)}
+            >
+              {t("viewFile")}
+            </button>
+          </div>
+          {!previewFullscreen && (
+            <audio className="audio-preview" controls src={audioPreviewUrl} />
+          )}
+        </>
+      );
+    }
+
+    if (videoPreviewUrl) {
+      return (
+        <>
+          <h3>{selectedFile.name}</h3>
+          <div className="preview-toolbar">
+            <button
+              type="button"
+              onClick={() => enterFullscreenView(selectedFile.path, true)}
+            >
+              {t("viewFile")}
+            </button>
+          </div>
+          {!previewFullscreen && (
+            <video className="video-preview" controls src={videoPreviewUrl} />
+          )}
+        </>
+      );
+    }
+
     return (
       <>
         <h3>{selectedFile.name}</h3>
         {fileContent !== null ? (
-          <pre>{fileContent}</pre>
+          <>
+            <div className="preview-toolbar">
+              <button
+                type="button"
+                onClick={() => enterFullscreenView(selectedFile.path, false)}
+              >
+                {t("viewFile")}
+              </button>
+            </div>
+            <pre>{fileContent}</pre>
+          </>
         ) : (
           <p className="hint">{t("noPreviewHint")}</p>
         )}
       </>
     );
+  }
+
+  function renderFullscreenContent() {
+    if (pdfPreviewUrl) {
+      return (
+        <embed
+          className="preview-fullscreen-embed"
+          src={`${pdfPreviewUrl}#toolbar=0&navpanes=0&scrollbar=0`}
+          type="application/pdf"
+        />
+      );
+    }
+    if (audioPreviewUrl) {
+      return (
+        <div className="preview-fullscreen-audio-wrap">
+          <audio
+            className="preview-fullscreen-audio"
+            controls
+            src={audioPreviewUrl}
+            ref={setMediaRef}
+            onLoadedMetadata={handleMediaLoadedMetadata}
+          />
+        </div>
+      );
+    }
+    if (videoPreviewUrl) {
+      return (
+        <video
+          className="preview-fullscreen-video"
+          controls
+          src={videoPreviewUrl}
+          ref={setMediaRef}
+          onLoadedMetadata={handleMediaLoadedMetadata}
+        />
+      );
+    }
+    if (fileContent !== null) {
+      return <pre className="preview-fullscreen-text">{fileContent}</pre>;
+    }
+    return null;
   }
 
   return (
@@ -985,24 +1345,17 @@ function FileExplorer() {
 
       <div className="panes">
         <div className={`file-list view-${viewMode}`}>
-          {loading && <p className="hint">{t("loading")}</p>}
-          {!loading && currentPath && entries.length > 0 && processedEntries.length === 0 && (
-            <p className="hint">{t("noResults")}</p>
+          {viewMode === "list" && (
+            <div className="file-list-header tree-entry-row">
+              <span className="tree-toggle-spacer" />
+              <span className="icon" aria-hidden="true" />
+              <span className="name">{t("columnName")}</span>
+              <span className="meta meta-size">{t("columnSize")}</span>
+              <span className="meta meta-date">{t("columnModified")}</span>
+              <span className="meta meta-date">{t("columnLastOpened")}</span>
+            </div>
           )}
-          {!loading && currentPath && entries.length === 0 && (
-            <p className="hint">{t("emptyFolder")}</p>
-          )}
-
-          {groupBy === "none"
-            ? renderEntryList(processedEntries)
-            : groupedEntries.map(({ category, items }) => (
-                <div className="group" key={category}>
-                  <h4 className="group-header">
-                    {t(GROUP_LABEL_KEYS[category])} ({items.length})
-                  </h4>
-                  {renderEntryList(items)}
-                </div>
-              ))}
+          {renderFileListContents()}
         </div>
 
         {viewMode === "list" && (
@@ -1020,12 +1373,53 @@ function FileExplorer() {
             onClick={() => {
               directorySummaryRequest.current += 1;
               setSelectedFile(null);
+              setFileContent(null);
+              clearPdfPreview();
             }}
             aria-label="Close preview"
           >
             ×
           </button>
           {renderSelectedPreview()}
+        </div>
+      )}
+
+      {previewFullscreen && (
+        <div className={panelResizing ? "preview-fullscreen resizing" : "preview-fullscreen"}>
+          <button
+            className="overlay-close preview-fullscreen-close"
+            onClick={() => setPreviewFullscreen(false)}
+            aria-label={t("closeFullscreen")}
+          >
+            ×
+          </button>
+          <div className="preview-fullscreen-content">{renderFullscreenContent()}</div>
+          <div className="preview-fullscreen-filelist" style={{ width: fullscreenPanelWidth }}>
+            <div
+              className="preview-fullscreen-resize-handle"
+              onPointerDown={handlePanelResizeStart}
+              onPointerMove={handlePanelResizeMove}
+              onPointerUp={handlePanelResizeEnd}
+              onPointerCancel={handlePanelResizeEnd}
+            />
+            <div className="file-list view-list">{renderFileListContents()}</div>
+          </div>
+        </div>
+      )}
+
+      {resumePrompt && (
+        <div className="modal-backdrop">
+          <div className="resume-prompt">
+            <p>{t("resumePromptMessage").replace("{time}", formatSeconds(resumePrompt.seconds))}</p>
+            <div className="resume-prompt-actions">
+              <button type="button" onClick={() => answerResumePrompt(false)}>
+                {t("no")}
+              </button>
+              <button type="button" className="primary" onClick={() => answerResumePrompt(true)}>
+                {t("yes")}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

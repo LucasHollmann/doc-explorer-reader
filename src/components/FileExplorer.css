@@ -417,6 +417,36 @@
   flex-shrink: 0;
 }
 
+.file-list .meta-size {
+  width: 70px;
+  text-align: right;
+}
+
+.file-list .meta-date {
+  width: 140px;
+}
+
+.file-list-header {
+  cursor: default;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  background: var(--panel-bg);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.file-list .file-list-header:hover {
+  background: var(--panel-bg);
+}
+
+.file-list-header .icon {
+  visibility: hidden;
+}
+
 /* Multiple columns: compact newspaper-style column flow */
 .file-list.view-grid ul {
   column-width: 170px;
@@ -546,8 +576,11 @@
 
 .preview {
   flex: 1;
+  display: flex;
+  flex-direction: column;
   padding: 1rem;
   overflow-y: auto;
+  min-height: 0;
 }
 
 .preview h3 {
@@ -581,6 +614,158 @@
   word-break: break-word;
   font-size: 0.85rem;
   color: var(--text);
+}
+
+.audio-preview {
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+.video-preview {
+  width: 100%;
+  max-height: 60vh;
+  margin-top: 0.5rem;
+  background: #000;
+  border-radius: 4px;
+}
+
+.preview-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 0.5rem;
+}
+
+.preview-toolbar {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.preview-toolbar button {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  background: var(--hover-bg);
+  color: var(--text);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.preview-toolbar button:hover {
+  border-color: var(--accent);
+}
+
+.pdf-preview {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  border: none;
+}
+
+.preview-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: var(--bg);
+  display: flex;
+}
+
+.preview-fullscreen-content {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+}
+
+.preview-fullscreen-embed {
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.preview-fullscreen-video {
+  max-width: 100%;
+  max-height: 100%;
+  background: #000;
+}
+
+.preview-fullscreen-audio-wrap {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  padding: 2rem;
+}
+
+.preview-fullscreen-audio {
+  width: 100%;
+  max-width: 480px;
+}
+
+.preview-fullscreen-text {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 2rem;
+  box-sizing: border-box;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.preview-fullscreen-close {
+  left: 0.6rem;
+  right: auto;
+  top: 0.6rem;
+  z-index: 1;
+}
+
+.preview-fullscreen-filelist {
+  flex: 0 0 auto;
+  display: flex;
+  height: 100%;
+  background: var(--panel-bg);
+  border-left: 1px solid var(--border-color);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
+}
+
+.preview-fullscreen-resize-handle {
+  flex: 0 0 6px;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.preview-fullscreen-resize-handle:hover {
+  background: var(--accent);
+}
+
+.preview-fullscreen.resizing {
+  cursor: ew-resize;
+  user-select: none;
+}
+
+.preview-fullscreen.resizing .preview-fullscreen-content {
+  pointer-events: none;
+}
+
+.preview-fullscreen.resizing .preview-fullscreen-resize-handle {
+  background: var(--accent);
+}
+
+.preview-fullscreen-filelist .file-list {
+  width: 100%;
+  border-right: none;
+  overflow-y: auto;
+}
+
+.preview-overlay .pdf-preview {
+  flex: none;
+  height: 40vh;
 }
 
 .preview-overlay {
@@ -643,4 +828,49 @@
   .advanced-filters-panel {
     align-items: flex-start;
   }
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.resume-prompt {
+  width: min(360px, 90vw);
+  background: var(--panel-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 1.25rem;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+}
+
+.resume-prompt p {
+  margin: 0 0 1rem;
+  color: var(--text);
+}
+
+.resume-prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.resume-prompt-actions button {
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+  background: var(--hover-bg);
+  color: var(--text);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.resume-prompt-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--panel-bg);
 }
