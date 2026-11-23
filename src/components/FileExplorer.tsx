@@ -15,6 +15,14 @@ import type { TranslationKey } from "../i18n/translations";
 import { readEnumPreference, readStorage, writeStorage } from "../storage/localStorage";
 import { CATEGORY_ORDER, categoryOf, iconFor, type Category } from "./fileCategories";
 import ContextMenu, { type ContextMenuItem, type ContextMenuState } from "./ContextMenu";
+import {
+  colorHexFor,
+  FILE_COLORS,
+  removeFileColor,
+  setFileColor,
+  type FileColorId,
+  type FileColors,
+} from "./fileColors";
 import { getLastOpened, recordLastOpened } from "./lastOpened";
 import { getMediaProgress, setMediaProgress } from "./mediaProgress";
 import {
@@ -53,18 +61,26 @@ type TreeDirectoryState = {
   error?: string;
 };
 
-type ViewMode = "list" | "grid" | "block";
+type ViewMode = "list" | "block";
 type TypeFilter = "all" | "folders" | "files";
 type SortKey = "name" | "size" | "created" | "modified" | "type";
 type SortDir = "asc" | "desc";
 type GroupBy = "none" | "type";
 
-const VIEW_MODES = ["list", "grid", "block"] as const;
+const VIEW_MODES = ["list", "block"] as const;
 const SORT_KEYS = ["name", "size", "created", "modified", "type"] as const;
 const SORT_DIRS = ["asc", "desc"] as const;
 const GROUP_BYS = ["none", "type"] as const;
 const FAVORITE_FOLDER_DRAG_TYPE = "application/x-doc-explorer-favorite-folder";
 const FAVORITE_GROUP_DRAG_TYPE = "application/x-doc-explorer-favorite-group";
+
+const COLOR_LABEL_KEYS: Record<FileColorId, TranslationKey> = {
+  red: "colorRed",
+  yellow: "colorYellow",
+  green: "colorGreen",
+  blue: "colorBlue",
+  purple: "colorPurple",
+};
 
 const GROUP_LABEL_KEYS: Record<Category, TranslationKey> = {
   folder: "groupFolders",
@@ -79,12 +95,6 @@ const GROUP_LABEL_KEYS: Record<Category, TranslationKey> = {
   text: "groupText",
   other: "groupOther",
 };
-
-const TEXT_EXTENSIONS = new Set([
-  "txt", "md", "json", "js", "jsx", "ts", "tsx", "css", "html", "xml",
-  "yml", "yaml", "toml", "rs", "py", "java", "c", "cpp", "h", "sh", "log",
-  "csv",
-]);
 
 const AUDIO_MIME_TYPES: Record<string, string> = {
   mp3: "audio/mpeg",
@@ -102,6 +112,18 @@ const VIDEO_MIME_TYPES: Record<string, string> = {
   mov: "video/quicktime",
   webm: "video/webm",
   flv: "video/x-flv",
+};
+
+const IMAGE_MIME_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  svg: "image/svg+xml",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  ico: "image/x-icon",
+  tiff: "image/tiff",
 };
 
 function favoriteGroups(entries: FavoriteEntry[]): FavoriteGroup[] {
@@ -145,10 +167,7 @@ function extensionOf(name: string): string {
 }
 
 function canPreviewEntry(entry: DirEntryInfo): boolean {
-  if (entry.is_dir) return false;
-  const ext = extensionOf(entry.name);
-  const category = categoryOf(false, ext);
-  return ext === "pdf" || category === "audio" || category === "video" || TEXT_EXTENSIONS.has(ext);
+  return !entry.is_dir;
 }
 
 function basenameOf(path: string): string {
@@ -199,6 +218,8 @@ function FileExplorer() {
   const audioPreviewUrlRef = useRef<string | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const videoPreviewUrlRef = useRef<string | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const imagePreviewUrlRef = useRef<string | null>(null);
   const mediaElRef = useRef<HTMLMediaElement | null>(null);
   const progressTrackingArmedRef = useRef(false);
   const pendingResumeSecondsRef = useRef<number | null>(null);
@@ -216,6 +237,7 @@ function FileExplorer() {
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(() => new Set());
   const [treeDirectories, setTreeDirectories] = useState<Record<string, TreeDirectoryState>>({});
 
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [extensionFilter, setExtensionFilter] = useState("");
   const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
@@ -232,6 +254,9 @@ function FileExplorer() {
   const [favorites, setFavorites] = useState<FavoriteEntry[]>(() =>
     sanitizeFavorites(readStorage<unknown>("favorites", [])),
   );
+  const [fileColors, setFileColors] = useState<FileColors>(() =>
+    readStorage<FileColors>("fileColors", {}),
+  );
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [openGroupIds, setOpenGroupIds] = useState<Set<string>>(() => new Set());
   const [creatingGroup, setCreatingGroup] = useState(false);
@@ -247,6 +272,7 @@ function FileExplorer() {
   useEffect(() => writeStorage("sortDir", sortDir), [sortDir]);
   useEffect(() => writeStorage("groupBy", groupBy), [groupBy]);
   useEffect(() => writeStorage("favorites", favorites), [favorites]);
+  useEffect(() => writeStorage("fileColors", fileColors), [fileColors]);
 
   function openContextMenu(e: ReactMouseEvent, items: ContextMenuItem[]) {
     e.preventDefault();
@@ -317,6 +343,29 @@ function FileExplorer() {
         onClick: () => toggleDirectoryTree(path),
       },
     ];
+  }
+
+  function fileMenuFor(entry: DirEntryInfo): ContextMenuItem[] {
+    const items: ContextMenuItem[] = [];
+    if (canPreviewEntry(entry)) {
+      items.push({ label: t("viewFile"), onClick: () => void openEntryInView(entry) });
+    }
+    for (const color of FILE_COLORS) {
+      items.push({
+        label: t(COLOR_LABEL_KEYS[color.id]),
+        swatch: color.hex,
+        compact: true,
+        onClick: () => setFileColors((prev) => setFileColor(prev, entry.path, color.id)),
+      });
+    }
+    if (fileColors[entry.path]) {
+      items.push({
+        label: t("removeColor"),
+        danger: true,
+        onClick: () => setFileColors((prev) => removeFileColor(prev, entry.path)),
+      });
+    }
+    return items;
   }
 
   function groupItemMenuFor(path: string): ContextMenuItem[] {
@@ -391,6 +440,18 @@ function FileExplorer() {
     return () => clearTimeout(timer);
   }, [error]);
 
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   async function loadDirectory(path: string, options?: { silent?: boolean }) {
     directorySummaryRequest.current += 1;
     setLoading(true);
@@ -457,6 +518,14 @@ function FileExplorer() {
     setVideoPreviewUrl(null);
   }
 
+  function clearImagePreview() {
+    if (imagePreviewUrlRef.current) {
+      URL.revokeObjectURL(imagePreviewUrlRef.current);
+      imagePreviewUrlRef.current = null;
+    }
+    setImagePreviewUrl(null);
+  }
+
   useEffect(() => {
     return () => {
       if (pdfPreviewUrlRef.current) {
@@ -467,6 +536,9 @@ function FileExplorer() {
       }
       if (videoPreviewUrlRef.current) {
         URL.revokeObjectURL(videoPreviewUrlRef.current);
+      }
+      if (imagePreviewUrlRef.current) {
+        URL.revokeObjectURL(imagePreviewUrlRef.current);
       }
     };
   }, []);
@@ -594,10 +666,7 @@ function FileExplorer() {
     clearPdfPreview();
     clearAudioPreview();
     clearVideoPreview();
-    if (!canPreviewEntry(entry)) {
-      setPreviewFullscreen(false);
-      setResumePrompt(null);
-    }
+    clearImagePreview();
     setError(null);
     setDirectorySummary(null);
     setDirectorySummaryLoading(false);
@@ -642,8 +711,16 @@ function FileExplorer() {
       return;
     }
 
-    if (!TEXT_EXTENSIONS.has(ext)) {
-      setFileContent(null);
+    if (category === "image") {
+      try {
+        const bytes = await readFile(entry.path);
+        const blob = new Blob([bytes], { type: IMAGE_MIME_TYPES[ext] ?? "image/png" });
+        const url = URL.createObjectURL(blob);
+        imagePreviewUrlRef.current = url;
+        setImagePreviewUrl(url);
+      } catch (e) {
+        setError(String(e));
+      }
       return;
     }
 
@@ -916,6 +993,7 @@ function FileExplorer() {
     const expanded = expandedDirectories.has(entry.path);
     const treeState = treeDirectories[entry.path];
     const blockView = viewMode === "block";
+    const colorHex = colorHexFor(fileColors[entry.path]);
     return (
       <li
         className={`tree-node${blockView && depth === 0 && entry.is_dir && expanded ? " expanded-tree-node" : ""}`}
@@ -935,7 +1013,12 @@ function FileExplorer() {
             }
           }}
           onContextMenu={(e) => {
-            if (entry.is_dir) openContextMenu(e, directoryMenuFor(entry.path));
+            if (entry.is_dir) {
+              openContextMenu(e, directoryMenuFor(entry.path));
+            } else {
+              const items = fileMenuFor(entry);
+              if (items.length > 0) openContextMenu(e, items);
+            }
           }}
           title={entry.path}
         >
@@ -955,6 +1038,7 @@ function FileExplorer() {
             <span className="tree-toggle-spacer" />
           )}
           <span className="icon">{iconFor(entry.is_dir, extensionOf(entry.name))}</span>
+          {colorHex && <span className="color-dot" style={{ backgroundColor: colorHex }} />}
           <span className="name">{entry.name}</span>
           {viewMode === "list" && (
             <>
@@ -1011,23 +1095,13 @@ function FileExplorer() {
 
     if (pdfPreviewUrl) {
       return (
-        <>
-          <div className="preview-pane">
-            <div className="preview-toolbar">
-              <button
-                type="button"
-                onClick={() => enterFullscreenView(selectedFile.path, false)}
-              >
-                {t("viewFile")}
-              </button>
-            </div>
-            <embed
-              className="pdf-preview"
-              src={`${pdfPreviewUrl}#toolbar=0&navpanes=0&scrollbar=0`}
-              type="application/pdf"
-            />
-          </div>
-        </>
+        <div className="preview-pane">
+          <embed
+            className="pdf-preview"
+            src={`${pdfPreviewUrl}#toolbar=0&navpanes=0&scrollbar=0`}
+            type="application/pdf"
+          />
+        </div>
       );
     }
 
@@ -1035,14 +1109,6 @@ function FileExplorer() {
       return (
         <>
           <h3>{selectedFile.name}</h3>
-          <div className="preview-toolbar">
-            <button
-              type="button"
-              onClick={() => enterFullscreenView(selectedFile.path, true)}
-            >
-              {t("viewFile")}
-            </button>
-          </div>
           {!previewFullscreen && (
             <audio className="audio-preview" controls src={audioPreviewUrl} />
           )}
@@ -1054,17 +1120,18 @@ function FileExplorer() {
       return (
         <>
           <h3>{selectedFile.name}</h3>
-          <div className="preview-toolbar">
-            <button
-              type="button"
-              onClick={() => enterFullscreenView(selectedFile.path, true)}
-            >
-              {t("viewFile")}
-            </button>
-          </div>
           {!previewFullscreen && (
             <video className="video-preview" controls src={videoPreviewUrl} />
           )}
+        </>
+      );
+    }
+
+    if (imagePreviewUrl) {
+      return (
+        <>
+          <h3>{selectedFile.name}</h3>
+          <img className="image-preview" src={imagePreviewUrl} alt={selectedFile.name} />
         </>
       );
     }
@@ -1073,17 +1140,7 @@ function FileExplorer() {
       <>
         <h3>{selectedFile.name}</h3>
         {fileContent !== null ? (
-          <>
-            <div className="preview-toolbar">
-              <button
-                type="button"
-                onClick={() => enterFullscreenView(selectedFile.path, false)}
-              >
-                {t("viewFile")}
-              </button>
-            </div>
-            <pre>{fileContent}</pre>
-          </>
+          <pre>{fileContent}</pre>
         ) : (
           <p className="hint">{t("noPreviewHint")}</p>
         )}
@@ -1122,6 +1179,15 @@ function FileExplorer() {
           src={videoPreviewUrl}
           ref={setMediaRef}
           onLoadedMetadata={handleMediaLoadedMetadata}
+        />
+      );
+    }
+    if (imagePreviewUrl) {
+      return (
+        <img
+          className="preview-fullscreen-image"
+          src={imagePreviewUrl}
+          alt={selectedFile?.name ?? ""}
         />
       );
     }
@@ -1190,13 +1256,6 @@ function FileExplorer() {
             ☰
           </button>
           <button
-            className={viewMode === "grid" ? "active" : ""}
-            title={t("viewGrid")}
-            onClick={() => setViewMode("grid")}
-          >
-            ▦
-          </button>
-          <button
             className={viewMode === "block" ? "active" : ""}
             title={t("viewBlock")}
             onClick={() => setViewMode("block")}
@@ -1263,6 +1322,7 @@ function FileExplorer() {
         <div className="controls">
           <div className="controls-main">
             <input
+              ref={searchInputRef}
               type="text"
               className="search-input"
               placeholder={t("searchPlaceholder")}
@@ -1357,16 +1417,9 @@ function FileExplorer() {
           )}
           {renderFileListContents()}
         </div>
-
-        {viewMode === "list" && (
-          <div className="preview">
-            {!selectedFile && <p className="hint">{t("selectFileHint")}</p>}
-            {renderSelectedPreview()}
-          </div>
-        )}
       </div>
 
-      {viewMode !== "list" && selectedFile && (
+      {selectedFile && (
         <div className="preview-overlay">
           <button
             className="overlay-close"
@@ -1375,6 +1428,9 @@ function FileExplorer() {
               setSelectedFile(null);
               setFileContent(null);
               clearPdfPreview();
+              clearAudioPreview();
+              clearVideoPreview();
+              clearImagePreview();
             }}
             aria-label="Close preview"
           >

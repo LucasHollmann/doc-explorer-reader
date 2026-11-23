@@ -327,15 +327,8 @@
 }
 
 .file-list {
-  width: 40%;
-  border-right: 1px solid var(--border-color);
-  overflow-y: auto;
-}
-
-.file-list.view-grid,
-.file-list.view-block {
   width: 100%;
-  border-right: none;
+  overflow-y: auto;
 }
 
 .file-list ul {
@@ -404,6 +397,13 @@
   overflow-wrap: anywhere;
 }
 
+.color-dot {
+  flex: 0 0 auto;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+}
+
 .file-list .name {
   flex: 1;
   overflow: hidden;
@@ -445,33 +445,6 @@
 
 .file-list-header .icon {
   visibility: hidden;
-}
-
-/* Multiple columns: compact newspaper-style column flow */
-.file-list.view-grid ul {
-  column-width: 170px;
-  column-gap: 0.5rem;
-  padding: 0.5rem;
-}
-
-.file-list.view-grid li {
-  break-inside: avoid;
-  border-bottom: none;
-  border-radius: 4px;
-  margin-bottom: 0.25rem;
-}
-
-.file-list.view-grid ul.tree-children {
-  display: block;
-  padding: 0 0 0 1rem;
-}
-
-.file-list.view-grid .tree-entry-row {
-  display: flex;
-}
-
-.file-list.view-grid .icon {
-  font-size: 1rem;
 }
 
 /* Block view: tile grid with large icons */
@@ -574,19 +547,6 @@
   border-color: var(--accent);
 }
 
-.preview {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  padding: 1rem;
-  overflow-y: auto;
-  min-height: 0;
-}
-
-.preview h3 {
-  color: var(--text);
-}
-
 .folder-summary {
   display: grid;
   grid-template-columns: max-content 1fr;
@@ -603,17 +563,9 @@
   color: var(--text);
 }
 
-.preview .error,
 .preview-overlay .error {
   padding: 0;
   background: transparent;
-}
-
-.preview pre {
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 0.85rem;
-  color: var(--text);
 }
 
 .audio-preview {
@@ -629,31 +581,20 @@
   border-radius: 4px;
 }
 
+.image-preview {
+  max-width: 100%;
+  max-height: 60vh;
+  margin-top: 0.5rem;
+  border-radius: 4px;
+  object-fit: contain;
+}
+
 .preview-pane {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
   gap: 0.5rem;
-}
-
-.preview-toolbar {
-  display: flex;
-  justify-content: flex-end;
-}
-
-.preview-toolbar button {
-  padding: 0.3rem 0.7rem;
-  font-size: 0.8rem;
-  cursor: pointer;
-  background: var(--hover-bg);
-  color: var(--text);
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-}
-
-.preview-toolbar button:hover {
-  border-color: var(--accent);
 }
 
 .pdf-preview {
@@ -691,6 +632,12 @@
   max-width: 100%;
   max-height: 100%;
   background: #000;
+}
+
+.preview-fullscreen-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
 }
 
 .preview-fullscreen-audio-wrap {
