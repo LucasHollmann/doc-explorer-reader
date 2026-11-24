@@ -4,8 +4,10 @@ import {
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
+  type Dispatch,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type SetStateAction,
 } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -192,7 +194,40 @@ function compareEntries(a: DirEntryInfo, b: DirEntryInfo, key: SortKey, dir: Sor
   return dir === "asc" ? cmp : -cmp;
 }
 
-function FileExplorer() {
+type TabMeta = {
+  id: string;
+  title: string;
+  initialPath: string;
+  initialFile?: string;
+};
+
+function createTab(initialPath: string, initialFile?: string): TabMeta {
+  return { id: crypto.randomUUID(), title: "", initialPath, initialFile };
+}
+
+type ExplorerTabProps = {
+  active: boolean;
+  initialPath: string;
+  initialFile?: string;
+  onPathChange: (path: string | null) => void;
+  onOpenInNewTab: (path: string, fileToSelect?: string) => void;
+  favorites: FavoriteEntry[];
+  setFavorites: Dispatch<SetStateAction<FavoriteEntry[]>>;
+  fileColors: FileColors;
+  setFileColors: Dispatch<SetStateAction<FileColors>>;
+};
+
+function ExplorerTab({
+  active,
+  initialPath,
+  initialFile,
+  onPathChange,
+  onOpenInNewTab,
+  favorites,
+  setFavorites,
+  fileColors,
+  setFileColors,
+}: ExplorerTabProps) {
   const { t, language, setLanguage } = useLanguage();
   const [viewMode, setViewMode] = useState<ViewMode>(() =>
     readEnumPreference("viewMode", VIEW_MODES, "list"),
@@ -201,6 +236,7 @@ function FileExplorer() {
   const [pathInput, setPathInput] = useState("");
   const [entries, setEntries] = useState<DirEntryInfo[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const selectionAnchorRef = useRef<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<DirEntryInfo | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
   const [pdfPreviewUrl, setPdfPreviewUrl] = useState<string | null>(null);
@@ -244,12 +280,6 @@ function FileExplorer() {
   const [groupBy, setGroupBy] = useState<GroupBy>(() =>
     readEnumPreference("groupBy", GROUP_BYS, "none"),
   );
-  const [favorites, setFavorites] = useState<FavoriteEntry[]>(() =>
-    sanitizeFavorites(readStorage<unknown>("favorites", [])),
-  );
-  const [fileColors, setFileColors] = useState<FileColors>(() =>
-    readStorage<FileColors>("fileColors", {}),
-  );
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [openGroupIds, setOpenGroupIds] = useState<Set<string>>(() => new Set());
   const [creatingGroup, setCreatingGroup] = useState(false);
@@ -264,8 +294,6 @@ function FileExplorer() {
   useEffect(() => writeStorage("sortKey", sortKey), [sortKey]);
   useEffect(() => writeStorage("sortDir", sortDir), [sortDir]);
   useEffect(() => writeStorage("groupBy", groupBy), [groupBy]);
-  useEffect(() => writeStorage("favorites", favorites), [favorites]);
-  useEffect(() => writeStorage("fileColors", fileColors), [fileColors]);
 
   function openContextMenu(e: ReactMouseEvent, items: ContextMenuItem[]) {
     e.preventDefault();
@@ -362,6 +390,7 @@ function FileExplorer() {
 
   function directoryMenuFor(path: string, colorPaths: string[]): ContextMenuItem[] {
     return [
+      { label: t("openInNewTab"), onClick: () => onOpenInNewTab(path) },
       ...favoriteMenuFor(path),
       {
         label: t(expandedDirectories.has(path) ? "hideFolderContents" : "showFolderContents"),
@@ -371,11 +400,19 @@ function FileExplorer() {
     ];
   }
 
-  function fileMenuFor(entry: DirEntryInfo, colorPaths: string[]): ContextMenuItem[] {
+  function fileMenuFor(
+    entry: DirEntryInfo,
+    colorPaths: string[],
+    parentPath: string | undefined,
+  ): ContextMenuItem[] {
     const items: ContextMenuItem[] = [];
     if (canPreviewEntry(entry)) {
       items.push({ label: t("viewFile"), onClick: () => void openEntryInView(entry) });
     }
+    items.push({
+      label: t("openInNewTab"),
+      onClick: () => onOpenInNewTab(parentPath ?? currentPath ?? "", entry.path),
+    });
     return [...items, ...colorMenuFor(colorPaths)];
   }
 
@@ -445,6 +482,38 @@ function FileExplorer() {
     setRenameValue("");
   }
 
+  const processedEntries = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    const extension = extensionFilter.trim().replace(/^\.+/, "").toLowerCase();
+    const filtered = entries.filter((entry) => {
+      if (typeFilter === "folders" && !entry.is_dir) return false;
+      if (typeFilter === "files" && entry.is_dir) return false;
+      if (query && !entry.name.toLowerCase().includes(query)) return false;
+      if (extension && (entry.is_dir || extensionOf(entry.name) !== extension)) return false;
+      return true;
+    });
+    return [...filtered].sort((a, b) => compareEntries(a, b, sortKey, sortDir));
+  }, [entries, searchQuery, extensionFilter, typeFilter, sortKey, sortDir]);
+
+  const groupedEntries = useMemo(() => {
+    if (groupBy !== "type") return [];
+    const buckets = new Map<Category, DirEntryInfo[]>();
+    for (const entry of processedEntries) {
+      const cat = categoryOf(entry.is_dir, extensionOf(entry.name));
+      if (!buckets.has(cat)) buckets.set(cat, []);
+      buckets.get(cat)!.push(entry);
+    }
+    return CATEGORY_ORDER.filter((cat) => buckets.has(cat)).map((cat) => ({
+      category: cat,
+      items: buckets.get(cat)!,
+    }));
+  }, [processedEntries, groupBy]);
+
+  const flatOrder = useMemo(
+    () => (groupBy === "type" ? groupedEntries.flatMap((group) => group.items) : processedEntries),
+    [groupBy, groupedEntries, processedEntries],
+  );
+
   useEffect(() => {
     if (!error) return;
     const timer = setTimeout(() => setError(null), 3000);
@@ -453,6 +522,12 @@ function FileExplorer() {
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      if (!active) return;
+      const target = e.target as HTMLElement | null;
+      const isTextInput =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target?.isContentEditable;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
         e.preventDefault();
         searchInputRef.current?.focus();
@@ -461,6 +536,9 @@ function FileExplorer() {
         e.preventDefault();
         pathInputRef.current?.focus();
         pathInputRef.current?.select();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && !isTextInput) {
+        e.preventDefault();
+        setSelectedPaths(flatOrder.map((entry) => entry.path));
       } else if (e.altKey && e.key === "ArrowUp") {
         e.preventDefault();
         goUp();
@@ -468,13 +546,17 @@ function FileExplorer() {
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentPath]);
+  }, [currentPath, active, flatOrder]);
 
-  async function loadDirectory(path: string, options?: { silent?: boolean }) {
+  async function loadDirectory(
+    path: string,
+    options?: { silent?: boolean },
+  ): Promise<DirEntryInfo[] | undefined> {
     directorySummaryRequest.current += 1;
     setLoading(true);
     if (!options?.silent) setError(null);
     setSelectedPaths([]);
+    selectionAnchorRef.current = null;
     setSelectedFile(null);
     setFileContent(null);
     setDirectorySummary(null);
@@ -485,19 +567,32 @@ function FileExplorer() {
       setEntries(result);
       setCurrentPath(path);
       setPathInput(path);
+      return result;
     } catch {
       if (!options?.silent) {
         setError(t("pathNotFoundError").replace("{path}", path));
       }
+      return undefined;
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
-    loadDirectory("C:\\", { silent: true });
+    loadDirectory(initialPath, { silent: true }).then((result) => {
+      const match = result?.find((entry) => entry.path === initialFile);
+      if (match) {
+        setSelectedPaths([match.path]);
+        void openEntryInView(match);
+      }
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    onPathChange(currentPath);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPath]);
 
   async function pickFolder() {
     const selected = await openDialog({ directory: true, multiple: false });
@@ -759,33 +854,6 @@ function FileExplorer() {
     loadDirectory(parent);
   }
 
-  const processedEntries = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
-    const extension = extensionFilter.trim().replace(/^\.+/, "").toLowerCase();
-    const filtered = entries.filter((entry) => {
-      if (typeFilter === "folders" && !entry.is_dir) return false;
-      if (typeFilter === "files" && entry.is_dir) return false;
-      if (query && !entry.name.toLowerCase().includes(query)) return false;
-      if (extension && (entry.is_dir || extensionOf(entry.name) !== extension)) return false;
-      return true;
-    });
-    return [...filtered].sort((a, b) => compareEntries(a, b, sortKey, sortDir));
-  }, [entries, searchQuery, extensionFilter, typeFilter, sortKey, sortDir]);
-
-  const groupedEntries = useMemo(() => {
-    if (groupBy !== "type") return [];
-    const buckets = new Map<Category, DirEntryInfo[]>();
-    for (const entry of processedEntries) {
-      const cat = categoryOf(entry.is_dir, extensionOf(entry.name));
-      if (!buckets.has(cat)) buckets.set(cat, []);
-      buckets.get(cat)!.push(entry);
-    }
-    return CATEGORY_ORDER.filter((cat) => buckets.has(cat)).map((cat) => ({
-      category: cat,
-      items: buckets.get(cat)!,
-    }));
-  }, [processedEntries, groupBy]);
-
   function startDraggingFolder(e: ReactDragEvent, path: string) {
     e.dataTransfer.setData(FAVORITE_FOLDER_DRAG_TYPE, path);
     e.dataTransfer.effectAllowed = "move";
@@ -953,8 +1021,15 @@ function FileExplorer() {
                     loadDirectory(item.path);
                     setOpenGroupIds(new Set());
                   }}
+                  onMouseDown={(e) => {
+                    if (e.button !== 1) return;
+                    e.preventDefault();
+                    onOpenInNewTab(item.path);
+                    setOpenGroupIds(new Set());
+                  }}
                   onContextMenu={(e) =>
                     openContextMenu(e, [
+                      { label: t("openInNewTab"), onClick: () => onOpenInNewTab(item.path) },
                       ...groupItemMenuFor(item.path),
                       newGroupMenuItem(group.id),
                     ])
@@ -976,7 +1051,7 @@ function FileExplorer() {
   function renderEntryList(list: DirEntryInfo[]) {
     return (
       <ul>
-        {list.map((entry) => renderTreeEntry(entry))}
+        {list.map((entry) => renderTreeEntry(entry, 0, currentPath ?? undefined))}
       </ul>
     );
   }
@@ -1006,7 +1081,7 @@ function FileExplorer() {
     );
   }
 
-  function renderTreeEntry(entry: DirEntryInfo, depth = 0) {
+  function renderTreeEntry(entry: DirEntryInfo, depth = 0, parentPath?: string) {
     const expanded = expandedDirectories.has(entry.path);
     const treeState = treeDirectories[entry.path];
     const blockView = viewMode === "block";
@@ -1022,16 +1097,31 @@ function FileExplorer() {
           onDragStart={(e) => startDraggingFolder(e, entry.path)}
           onDragEnd={endDraggingFavorite}
           onClick={(e) => {
+            if (e.shiftKey) {
+              const anchor = selectionAnchorRef.current ?? entry.path;
+              const anchorIndex = flatOrder.findIndex((item) => item.path === anchor);
+              const targetIndex = flatOrder.findIndex((item) => item.path === entry.path);
+              if (anchorIndex === -1 || targetIndex === -1) {
+                setSelectedPaths([entry.path]);
+              } else {
+                const [start, end] =
+                  anchorIndex <= targetIndex ? [anchorIndex, targetIndex] : [targetIndex, anchorIndex];
+                setSelectedPaths(flatOrder.slice(start, end + 1).map((item) => item.path));
+              }
+              return;
+            }
             if (e.ctrlKey || e.metaKey) {
               setSelectedPaths((prev) =>
                 prev.includes(entry.path)
                   ? prev.filter((path) => path !== entry.path)
                   : [...prev, entry.path],
               );
+              selectionAnchorRef.current = entry.path;
               return;
             }
             if (previewFullscreen && e.detail > 1) return;
             setSelectedPaths([entry.path]);
+            selectionAnchorRef.current = entry.path;
             if (previewFullscreen && canPreviewEntry(entry)) {
               void openEntryInView(entry);
             } else {
@@ -1045,6 +1135,15 @@ function FileExplorer() {
               void openEntryInView(entry);
             }
           }}
+          onMouseDown={(e) => {
+            if (e.button !== 1) return;
+            e.preventDefault();
+            if (entry.is_dir) {
+              onOpenInNewTab(entry.path);
+            } else {
+              onOpenInNewTab(parentPath ?? currentPath ?? "", entry.path);
+            }
+          }}
           onContextMenu={(e) => {
             const colorPaths = selectedPaths.includes(entry.path)
               ? selectedPaths
@@ -1053,7 +1152,7 @@ function FileExplorer() {
             if (entry.is_dir) {
               openContextMenu(e, directoryMenuFor(entry.path, colorPaths));
             } else {
-              const items = fileMenuFor(entry, colorPaths);
+              const items = fileMenuFor(entry, colorPaths, parentPath);
               if (items.length > 0) openContextMenu(e, items);
             }
           }}
@@ -1095,7 +1194,9 @@ function FileExplorer() {
               {treeState?.entries?.length === 0 && (
                 <li className="tree-message hint">{t("emptyFolder")}</li>
               )}
-              {treeState?.entries?.map((child) => renderTreeEntry(child, depth + 1))}
+              {treeState?.entries?.map((child) =>
+                renderTreeEntry(child, depth + 1, entry.path),
+              )}
             </ul>
           </div>
         )}
@@ -1235,7 +1336,7 @@ function FileExplorer() {
   }
 
   return (
-    <main className="explorer">
+    <main className="explorer" style={{ display: active ? "flex" : "none" }}>
       <header className="toolbar">
         <div className="path-bar">
           <button
@@ -1343,8 +1444,17 @@ function FileExplorer() {
               onDragStart={(e) => startDraggingFolder(e, entry.path)}
               onDragEnd={endDraggingFavorite}
               onClick={() => loadDirectory(entry.path)}
+              onMouseDown={(e) => {
+                if (e.button !== 1) return;
+                e.preventDefault();
+                onOpenInNewTab(entry.path);
+              }}
               onContextMenu={(e) =>
-                openContextMenu(e, [...favoriteMenuFor(entry.path), newGroupMenuItem(null)])
+                openContextMenu(e, [
+                  { label: t("openInNewTab"), onClick: () => onOpenInNewTab(entry.path) },
+                  ...favoriteMenuFor(entry.path),
+                  newGroupMenuItem(null),
+                ])
               }
             >
               <span className="favorite-name">{basenameOf(entry.path)}</span>
@@ -1536,6 +1646,141 @@ function FileExplorer() {
 
       <ContextMenu state={contextMenu} onClose={() => setContextMenu(null)} />
     </main>
+  );
+}
+
+function FileExplorer() {
+  const { t } = useLanguage();
+  const [favorites, setFavorites] = useState<FavoriteEntry[]>(() =>
+    sanitizeFavorites(readStorage<unknown>("favorites", [])),
+  );
+  const [fileColors, setFileColors] = useState<FileColors>(() =>
+    readStorage<FileColors>("fileColors", {}),
+  );
+  useEffect(() => writeStorage("favorites", favorites), [favorites]);
+  useEffect(() => writeStorage("fileColors", fileColors), [fileColors]);
+
+  const [tabs, setTabs] = useState<TabMeta[]>(() => [createTab("C:\\")]);
+  const [activeTabId, setActiveTabId] = useState<string>(() => tabs[0].id);
+  const tabPaths = useRef<Record<string, string | null>>({});
+  const previousActiveTabIdRef = useRef<string | null>(null);
+
+  function switchToTab(id: string) {
+    if (id === activeTabId) return;
+    previousActiveTabIdRef.current = activeTabId;
+    setActiveTabId(id);
+  }
+
+  function handleTabPathChange(id: string, path: string | null) {
+    tabPaths.current[id] = path;
+    setTabs((prev) =>
+      prev.map((tab) => (tab.id === id ? { ...tab, title: path ? basenameOf(path) : "" } : tab)),
+    );
+  }
+
+  function addTab() {
+    const basePath = tabPaths.current[activeTabId] ?? "C:\\";
+    const tab = createTab(basePath);
+    setTabs([...tabs, tab]);
+    switchToTab(tab.id);
+  }
+
+  function closeTab(id: string) {
+    if (tabs.length <= 1) return;
+    const index = tabs.findIndex((tab) => tab.id === id);
+    const remaining = tabs.filter((tab) => tab.id !== id);
+    setTabs(remaining);
+    if (previousActiveTabIdRef.current === id) {
+      previousActiveTabIdRef.current = null;
+    }
+    if (id === activeTabId) {
+      const fallback = remaining[Math.max(0, index - 1)] ?? remaining[0];
+      setActiveTabId(fallback.id);
+    }
+    delete tabPaths.current[id];
+  }
+
+  function openInNewTab(path: string, fileToSelect?: string) {
+    const tab = createTab(path, fileToSelect);
+    setTabs([...tabs, tab]);
+    switchToTab(tab.id);
+  }
+
+  function switchToLastOrNextTab() {
+    const previousId = previousActiveTabIdRef.current;
+    if (previousId && tabs.some((tab) => tab.id === previousId)) {
+      switchToTab(previousId);
+      return;
+    }
+    const currentIndex = tabs.findIndex((tab) => tab.id === activeTabId);
+    const nextTab = tabs[(currentIndex + 1) % tabs.length];
+    if (nextTab) switchToTab(nextTab.id);
+  }
+
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "t") {
+        e.preventDefault();
+        addTab();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "w") {
+        e.preventDefault();
+        closeTab(activeTabId);
+      } else if (e.ctrlKey && e.key === "Tab") {
+        e.preventDefault();
+        switchToLastOrNextTab();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabs, activeTabId]);
+
+  return (
+    <div className="explorer-tabs">
+      <div className="tab-bar">
+        {tabs.map((tab) => (
+          <div
+            key={tab.id}
+            className={`tab${tab.id === activeTabId ? " active" : ""}`}
+            title={tab.title}
+            onClick={() => switchToTab(tab.id)}
+          >
+            <button className="tab-button">{tab.title || t("newTab")}</button>
+            {tabs.length > 1 && (
+              <button
+                className="tab-close"
+                aria-label={t("closeTab")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeTab(tab.id);
+                }}
+              >
+                ×
+              </button>
+            )}
+          </div>
+        ))}
+        <button className="tab-add" title={t("newTab")} onClick={addTab}>
+          +
+        </button>
+      </div>
+      <div className="tab-panels">
+        {tabs.map((tab) => (
+          <ExplorerTab
+            key={tab.id}
+            active={tab.id === activeTabId}
+            initialPath={tab.initialPath}
+            initialFile={tab.initialFile}
+            onPathChange={(path) => handleTabPathChange(tab.id, path)}
+            onOpenInNewTab={openInNewTab}
+            favorites={favorites}
+            setFavorites={setFavorites}
+            fileColors={fileColors}
+            setFileColors={setFileColors}
+          />
+        ))}
+      </div>
+    </div>
   );
 }
 

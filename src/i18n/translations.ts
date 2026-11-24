@@ -70,6 +70,9 @@ export const translations = {
     colorBlue: "Azul",
     colorPurple: "Roxo",
     removeColor: "Remover cor",
+    newTab: "Nova aba",
+    closeTab: "Fechar aba",
+    openInNewTab: "Abrir em nova aba",
   },
   en: {
     chooseFolder: "Choose folder",
@@ -140,6 +143,9 @@ export const translations = {
     colorBlue: "Blue",
     colorPurple: "Purple",
     removeColor: "Remove color",
+    newTab: "New tab",
+    closeTab: "Close tab",
+    openInNewTab: "Open in new tab",
   },
 } satisfies Record<Language, Record<string, string>>;
 
