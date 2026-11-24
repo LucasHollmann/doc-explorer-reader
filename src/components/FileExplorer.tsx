@@ -7,7 +7,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { readFile, readTextFile } from "@tauri-apps/plugin-fs";
 import { useLanguage } from "../i18n/LanguageContext";
@@ -105,15 +105,6 @@ const AUDIO_MIME_TYPES: Record<string, string> = {
   aac: "audio/aac",
 };
 
-const VIDEO_MIME_TYPES: Record<string, string> = {
-  mp4: "video/mp4",
-  mkv: "video/x-matroska",
-  avi: "video/x-msvideo",
-  mov: "video/quicktime",
-  webm: "video/webm",
-  flv: "video/x-flv",
-};
-
 const IMAGE_MIME_TYPES: Record<string, string> = {
   png: "image/png",
   jpg: "image/jpeg",
@@ -209,6 +200,7 @@ function FileExplorer() {
   const [currentPath, setCurrentPath] = useState<string | null>(null);
   const [pathInput, setPathInput] = useState("");
   const [entries, setEntries] = useState<DirEntryInfo[]>([]);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<DirEntryInfo | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
   const [pdfPreviewUrl, setPdfPreviewUrl] = useState<string | null>(null);
@@ -238,6 +230,7 @@ function FileExplorer() {
   const [treeDirectories, setTreeDirectories] = useState<Record<string, TreeDirectoryState>>({});
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const pathInputRef = useRef<HTMLInputElement | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [extensionFilter, setExtensionFilter] = useState("");
   const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
@@ -278,6 +271,15 @@ function FileExplorer() {
     e.preventDefault();
     e.stopPropagation();
     setContextMenu({ x: e.clientX, y: e.clientY, items });
+  }
+
+  function sortBy(key: SortKey) {
+    if (sortKey === key) {
+      setSortDir((dir) => (dir === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir("asc");
+    }
   }
 
   function favoriteMenuFor(path: string): ContextMenuItem[] {
@@ -335,37 +337,46 @@ function FileExplorer() {
       });
   }
 
-  function directoryMenuFor(path: string): ContextMenuItem[] {
+  function colorMenuFor(paths: string[]): ContextMenuItem[] {
+    const items: ContextMenuItem[] = FILE_COLORS.map((color) => ({
+      label: t(COLOR_LABEL_KEYS[color.id]),
+      swatch: color.hex,
+      compact: true,
+      onClick: () =>
+        setFileColors((prev) =>
+          paths.reduce((next, path) => setFileColor(next, path, color.id), prev),
+        ),
+    }));
+    if (paths.some((path) => fileColors[path])) {
+      items.push({
+        label: t("removeColor"),
+        swatch: undefined,
+        compact: false,
+        danger: true,
+        onClick: () =>
+          setFileColors((prev) => paths.reduce((next, path) => removeFileColor(next, path), prev)),
+      });
+    }
+    return items;
+  }
+
+  function directoryMenuFor(path: string, colorPaths: string[]): ContextMenuItem[] {
     return [
       ...favoriteMenuFor(path),
       {
         label: t(expandedDirectories.has(path) ? "hideFolderContents" : "showFolderContents"),
         onClick: () => toggleDirectoryTree(path),
       },
+      ...colorMenuFor(colorPaths),
     ];
   }
 
-  function fileMenuFor(entry: DirEntryInfo): ContextMenuItem[] {
+  function fileMenuFor(entry: DirEntryInfo, colorPaths: string[]): ContextMenuItem[] {
     const items: ContextMenuItem[] = [];
     if (canPreviewEntry(entry)) {
       items.push({ label: t("viewFile"), onClick: () => void openEntryInView(entry) });
     }
-    for (const color of FILE_COLORS) {
-      items.push({
-        label: t(COLOR_LABEL_KEYS[color.id]),
-        swatch: color.hex,
-        compact: true,
-        onClick: () => setFileColors((prev) => setFileColor(prev, entry.path, color.id)),
-      });
-    }
-    if (fileColors[entry.path]) {
-      items.push({
-        label: t("removeColor"),
-        danger: true,
-        onClick: () => setFileColors((prev) => removeFileColor(prev, entry.path)),
-      });
-    }
-    return items;
+    return [...items, ...colorMenuFor(colorPaths)];
   }
 
   function groupItemMenuFor(path: string): ContextMenuItem[] {
@@ -446,16 +457,24 @@ function FileExplorer() {
         e.preventDefault();
         searchInputRef.current?.focus();
         searchInputRef.current?.select();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        pathInputRef.current?.focus();
+        pathInputRef.current?.select();
+      } else if (e.altKey && e.key === "ArrowUp") {
+        e.preventDefault();
+        goUp();
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  }, [currentPath]);
 
   async function loadDirectory(path: string, options?: { silent?: boolean }) {
     directorySummaryRequest.current += 1;
     setLoading(true);
     if (!options?.silent) setError(null);
+    setSelectedPaths([]);
     setSelectedFile(null);
     setFileContent(null);
     setDirectorySummary(null);
@@ -511,10 +530,10 @@ function FileExplorer() {
   }
 
   function clearVideoPreview() {
-    if (videoPreviewUrlRef.current) {
+    if (videoPreviewUrlRef.current?.startsWith("blob:")) {
       URL.revokeObjectURL(videoPreviewUrlRef.current);
-      videoPreviewUrlRef.current = null;
     }
+    videoPreviewUrlRef.current = null;
     setVideoPreviewUrl(null);
   }
 
@@ -534,7 +553,7 @@ function FileExplorer() {
       if (audioPreviewUrlRef.current) {
         URL.revokeObjectURL(audioPreviewUrlRef.current);
       }
-      if (videoPreviewUrlRef.current) {
+      if (videoPreviewUrlRef.current?.startsWith("blob:")) {
         URL.revokeObjectURL(videoPreviewUrlRef.current);
       }
       if (imagePreviewUrlRef.current) {
@@ -700,9 +719,7 @@ function FileExplorer() {
 
     if (category === "video") {
       try {
-        const bytes = await readFile(entry.path);
-        const blob = new Blob([bytes], { type: VIDEO_MIME_TYPES[ext] ?? "video/mp4" });
-        const url = URL.createObjectURL(blob);
+        const url = convertFileSrc(entry.path);
         videoPreviewUrlRef.current = url;
         setVideoPreviewUrl(url);
       } catch (e) {
@@ -1000,23 +1017,43 @@ function FileExplorer() {
         key={entry.path}
       >
         <div
-          className={`tree-entry-row${blockView && depth === 0 && !expanded ? " tree-block-tile" : ""}${blockView && (expanded || depth > 0) ? " tree-compact-row" : ""}${selectedFile?.path === entry.path ? " selected" : ""}`}
+          className={`tree-entry-row${blockView && depth === 0 && !expanded ? " tree-block-tile" : ""}${blockView && (expanded || depth > 0) ? " tree-compact-row" : ""}${selectedPaths.includes(entry.path) ? " selected" : ""}`}
           draggable={entry.is_dir}
           onDragStart={(e) => startDraggingFolder(e, entry.path)}
           onDragEnd={endDraggingFavorite}
-          onClick={() => openEntry(entry)}
+          onClick={(e) => {
+            if (e.ctrlKey || e.metaKey) {
+              setSelectedPaths((prev) =>
+                prev.includes(entry.path)
+                  ? prev.filter((path) => path !== entry.path)
+                  : [...prev, entry.path],
+              );
+              return;
+            }
+            if (previewFullscreen && e.detail > 1) return;
+            setSelectedPaths([entry.path]);
+            if (previewFullscreen && canPreviewEntry(entry)) {
+              void openEntryInView(entry);
+            } else {
+              openEntry(entry);
+            }
+          }}
           onDoubleClick={() => {
             if (entry.is_dir) {
               void loadDirectory(entry.path);
-            } else if (canPreviewEntry(entry)) {
+            } else if (!previewFullscreen && canPreviewEntry(entry)) {
               void openEntryInView(entry);
             }
           }}
           onContextMenu={(e) => {
+            const colorPaths = selectedPaths.includes(entry.path)
+              ? selectedPaths
+              : [entry.path];
+            setSelectedPaths(colorPaths);
             if (entry.is_dir) {
-              openContextMenu(e, directoryMenuFor(entry.path));
+              openContextMenu(e, directoryMenuFor(entry.path, colorPaths));
             } else {
-              const items = fileMenuFor(entry);
+              const items = fileMenuFor(entry, colorPaths);
               if (items.length > 0) openContextMenu(e, items);
             }
           }}
@@ -1203,17 +1240,19 @@ function FileExplorer() {
         <div className="path-bar">
           <button
             className="icon-btn"
-            title={t("exitFolder")}
+            title={`${t("exitFolder")} (Alt+Up)`}
             onClick={goUp}
             disabled={!currentPath}
           >
             ⬆
           </button>
           <input
+            ref={pathInputRef}
             type="text"
             className="path-input"
             value={pathInput}
             placeholder={t("noFolderSelected")}
+            title="Ctrl+L"
             onChange={(e) => setPathInput(e.currentTarget.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") commitPathInput();
@@ -1409,9 +1448,24 @@ function FileExplorer() {
             <div className="file-list-header tree-entry-row">
               <span className="tree-toggle-spacer" />
               <span className="icon" aria-hidden="true" />
-              <span className="name">{t("columnName")}</span>
-              <span className="meta meta-size">{t("columnSize")}</span>
-              <span className="meta meta-date">{t("columnModified")}</span>
+              <span className="name">
+                <button className="column-sort" onClick={() => sortBy("name")}>
+                  {t("columnName")}
+                  {sortKey === "name" ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+                </button>
+              </span>
+              <span className="meta meta-size">
+                <button className="column-sort" onClick={() => sortBy("size")}>
+                  {t("columnSize")}
+                  {sortKey === "size" ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+                </button>
+              </span>
+              <span className="meta meta-date">
+                <button className="column-sort" onClick={() => sortBy("modified")}>
+                  {t("columnModified")}
+                  {sortKey === "modified" ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+                </button>
+              </span>
               <span className="meta meta-date">{t("columnLastOpened")}</span>
             </div>
           )}
@@ -1425,6 +1479,7 @@ function FileExplorer() {
             className="overlay-close"
             onClick={() => {
               directorySummaryRequest.current += 1;
+              setSelectedPaths([]);
               setSelectedFile(null);
               setFileContent(null);
               clearPdfPreview();
