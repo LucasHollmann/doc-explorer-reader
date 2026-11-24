@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import "./ContextMenu.css";
 
 export type ContextMenuItem = {
@@ -21,6 +22,35 @@ type Props = {
 
 function ContextMenu({ state, onClose }: Props) {
   if (!state) return null;
+  return <ContextMenuPanel key={`${state.x}-${state.y}`} state={state} onClose={onClose} />;
+}
+
+function ContextMenuPanel({
+  state,
+  onClose,
+}: {
+  state: ContextMenuState;
+  onClose: () => void;
+}) {
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const margin = 4;
+    let top = state.y;
+    let left = state.x;
+    if (top + rect.height > window.innerHeight - margin) {
+      top = Math.max(margin, state.y - rect.height);
+    }
+    if (left + rect.width > window.innerWidth - margin) {
+      left = Math.max(margin, state.x - rect.width);
+    }
+    setPosition({ top, left });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const rows: ContextMenuItem[][] = [];
   for (const item of state.items) {
@@ -32,6 +62,10 @@ function ContextMenu({ state, onClose }: Props) {
     }
   }
 
+  const style: CSSProperties = position
+    ? { top: position.top, left: position.left }
+    : { top: state.y, left: state.x, visibility: "hidden" };
+
   return (
     <>
       <div
@@ -42,7 +76,7 @@ function ContextMenu({ state, onClose }: Props) {
           onClose();
         }}
       />
-      <div className="context-menu" style={{ top: state.y, left: state.x }}>
+      <div className="context-menu" ref={menuRef} style={style}>
         {rows.map((row, index) =>
           row[0].compact ? (
             <div className="context-menu-row" key={index}>

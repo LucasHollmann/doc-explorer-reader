@@ -11,7 +11,7 @@ import {
 } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { readFile, readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { mkdir, readFile, readTextFile, remove, rename, writeTextFile } from "@tauri-apps/plugin-fs";
 import { useLanguage } from "../i18n/LanguageContext";
 import type { TranslationKey } from "../i18n/translations";
 import { readEnumPreference, readStorage, writeStorage } from "../storage/localStorage";
@@ -75,6 +75,7 @@ const SORT_DIRS = ["asc", "desc"] as const;
 const GROUP_BYS = ["none", "type"] as const;
 const FAVORITE_FOLDER_DRAG_TYPE = "application/x-doc-explorer-favorite-folder";
 const FAVORITE_GROUP_DRAG_TYPE = "application/x-doc-explorer-favorite-group";
+const FILE_MOVE_DRAG_TYPE = "application/x-doc-explorer-move-entry";
 
 const COLOR_LABEL_KEYS: Record<FileColorId, TranslationKey> = {
   red: "colorRed",
@@ -168,6 +169,11 @@ function basenameOf(path: string): string {
   const trimmed = path.replace(/[\\/]+$/, "");
   const idx = trimmed.lastIndexOf(sep);
   return idx === -1 ? trimmed : trimmed.slice(idx + 1);
+}
+
+function joinPath(dir: string, name: string): string {
+  const sep = dir.includes("\\") ? "\\" : "/";
+  return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`;
 }
 
 function compareEntries(a: DirEntryInfo, b: DirEntryInfo, key: SortKey, dir: SortDir): number {
@@ -273,6 +279,7 @@ function ExplorerTab({
   const [searchQuery, setSearchQuery] = useState("");
   const [extensionFilter, setExtensionFilter] = useState("");
   const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
+  const [newItemMenuOpen, setNewItemMenuOpen] = useState(false);
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [sortKey, setSortKey] = useState<SortKey>(() =>
     readEnumPreference("sortKey", SORT_KEYS, "name"),
@@ -292,6 +299,15 @@ function ExplorerTab({
   const [renameValue, setRenameValue] = useState("");
   const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null);
   const [isDraggingFavorite, setIsDraggingFavorite] = useState(false);
+  const [renamingPath, setRenamingPath] = useState<string | null>(null);
+  const [entryRenameValue, setEntryRenameValue] = useState("");
+  const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState<{ paths: string[] } | null>(null);
+  const [bulkRenameEntries, setBulkRenameEntries] = useState<DirEntryInfo[] | null>(null);
+  const [bulkPattern, setBulkPattern] = useState("");
+  const [bulkStartNumber, setBulkStartNumber] = useState(1);
+  const [bulkOverrides, setBulkOverrides] = useState<Record<string, string>>({});
+  const [bulkSaving, setBulkSaving] = useState(false);
 
   useEffect(() => writeStorage("viewMode", viewMode), [viewMode]);
   useEffect(() => writeStorage("sortKey", sortKey), [sortKey]);
@@ -338,20 +354,7 @@ function ExplorerTab({
     return items;
   }
 
-  function toggleDirectoryTree(path: string) {
-    if (expandedDirectories.has(path)) {
-      setExpandedDirectories((prev) => {
-        const next = new Set(prev);
-        next.delete(path);
-        return next;
-      });
-      return;
-    }
-
-    setExpandedDirectories((prev) => new Set(prev).add(path));
-    const cached = treeDirectories[path];
-    if (cached?.entries || cached?.loading) return;
-
+  function fetchTreeDirectory(path: string) {
     setTreeDirectories((prev) => ({ ...prev, [path]: { loading: true } }));
     void invoke<DirEntryInfo[]>("read_directory", { path })
       .then((children) => {
@@ -366,6 +369,29 @@ function ExplorerTab({
           [path]: { error: String(cause) },
         }));
       });
+  }
+
+  function toggleDirectoryTree(path: string) {
+    if (expandedDirectories.has(path)) {
+      setExpandedDirectories((prev) => {
+        const next = new Set(prev);
+        next.delete(path);
+        return next;
+      });
+      return;
+    }
+
+    setExpandedDirectories((prev) => new Set(prev).add(path));
+    const cached = treeDirectories[path];
+    if (cached?.entries || cached?.loading) return;
+    fetchTreeDirectory(path);
+  }
+
+  function refreshAllVisibleDirectories() {
+    if (currentPath) void loadDirectory(currentPath, { silent: true });
+    for (const path of Object.keys(treeDirectories)) {
+      fetchTreeDirectory(path);
+    }
   }
 
   function colorMenuFor(paths: string[]): ContextMenuItem[] {
@@ -391,16 +417,27 @@ function ExplorerTab({
     return items;
   }
 
-  function directoryMenuFor(path: string, colorPaths: string[]): ContextMenuItem[] {
-    return [
-      { label: t("openInNewTab"), onClick: () => onOpenInNewTab(path) },
-      ...favoriteMenuFor(path),
+  function directoryMenuFor(
+    entry: DirEntryInfo,
+    colorPaths: string[],
+    parentPath: string | undefined,
+  ): ContextMenuItem[] {
+    const items: ContextMenuItem[] = [
+      { label: t("openInNewTab"), onClick: () => onOpenInNewTab(entry.path) },
+      ...favoriteMenuFor(entry.path),
       {
-        label: t(expandedDirectories.has(path) ? "hideFolderContents" : "showFolderContents"),
-        onClick: () => toggleDirectoryTree(path),
+        label: t(expandedDirectories.has(entry.path) ? "hideFolderContents" : "showFolderContents"),
+        onClick: () => toggleDirectoryTree(entry.path),
       },
-      ...colorMenuFor(colorPaths),
     ];
+    if (colorPaths.length === 1 && parentPath) {
+      items.push({ label: t("rename"), onClick: () => startRenaming(entry) });
+    } else if (colorPaths.length > 1) {
+      items.push({ label: t("renameMultiple"), onClick: () => startBulkRenaming(colorPaths) });
+    }
+    items.push(...colorMenuFor(colorPaths));
+    items.push({ label: t("delete"), danger: true, onClick: () => requestDelete(colorPaths) });
+    return items;
   }
 
   function fileMenuFor(
@@ -416,7 +453,14 @@ function ExplorerTab({
       label: t("openInNewTab"),
       onClick: () => onOpenInNewTab(parentPath ?? currentPath ?? "", entry.path),
     });
-    return [...items, ...colorMenuFor(colorPaths)];
+    if (colorPaths.length === 1 && parentPath) {
+      items.push({ label: t("rename"), onClick: () => startRenaming(entry) });
+    } else if (colorPaths.length > 1) {
+      items.push({ label: t("renameMultiple"), onClick: () => startBulkRenaming(colorPaths) });
+    }
+    items.push(...colorMenuFor(colorPaths));
+    items.push({ label: t("delete"), danger: true, onClick: () => requestDelete(colorPaths) });
+    return items;
   }
 
   function groupItemMenuFor(path: string): ContextMenuItem[] {
@@ -524,6 +568,37 @@ function ExplorerTab({
   }, [error]);
 
   useEffect(() => {
+    if (!deleteConfirmation) return;
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void confirmDelete();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        setDeleteConfirmation(null);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [deleteConfirmation]);
+
+  useEffect(() => {
+    if (!bulkRenameEntries) return;
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (isBulkRenameValid()) void confirmBulkRenaming();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancelBulkRenaming();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bulkRenameEntries, bulkPattern, bulkStartNumber, bulkOverrides]);
+
+  useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (!active) return;
       const target = e.target as HTMLElement | null;
@@ -545,6 +620,17 @@ function ExplorerTab({
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
         saveTextEditsRef.current();
+      } else if (e.key === "F2" && !isTextInput) {
+        e.preventDefault();
+        if (selectedPaths.length === 1 && currentPath) {
+          const entry = flatOrder.find((item) => item.path === selectedPaths[0]);
+          if (entry) startRenaming(entry);
+        } else if (selectedPaths.length > 1) {
+          startBulkRenaming(selectedPaths);
+        }
+      } else if (e.key === "Delete" && !isTextInput) {
+        e.preventDefault();
+        if (selectedPaths.length > 0) requestDelete(selectedPaths);
       } else if (e.altKey && e.key === "ArrowUp") {
         e.preventDefault();
         goUp();
@@ -552,7 +638,7 @@ function ExplorerTab({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentPath, active, flatOrder]);
+  }, [currentPath, active, flatOrder, selectedPaths]);
 
   async function loadDirectory(
     path: string,
@@ -868,14 +954,218 @@ function ExplorerTab({
     }
   }
 
+  function parentPathOf(path: string): string | null {
+    const sep = path.includes("\\") ? "\\" : "/";
+    const trimmed = path.replace(/[\\/]+$/, "");
+    const parentIdx = trimmed.lastIndexOf(sep);
+    if (parentIdx <= 0) return null;
+    return trimmed.slice(0, parentIdx) || sep;
+  }
+
   function goUp() {
     if (!currentPath) return;
-    const sep = currentPath.includes("\\") ? "\\" : "/";
-    const trimmed = currentPath.replace(/[\\/]+$/, "");
-    const parentIdx = trimmed.lastIndexOf(sep);
-    if (parentIdx <= 0) return;
-    const parent = trimmed.slice(0, parentIdx) || sep;
-    loadDirectory(parent);
+    const parent = parentPathOf(currentPath);
+    if (parent) loadDirectory(parent);
+  }
+
+  function startRenaming(entry: DirEntryInfo) {
+    setRenamingPath(entry.path);
+    setEntryRenameValue(entry.name);
+  }
+
+  function cancelRenaming() {
+    setRenamingPath(null);
+    setEntryRenameValue("");
+  }
+
+  async function commitRenaming(entry: DirEntryInfo, parentPath: string) {
+    const trimmed = entryRenameValue.trim();
+    cancelRenaming();
+    if (!trimmed || trimmed === entry.name) return;
+    const newPath = joinPath(parentPath, trimmed);
+    try {
+      await rename(entry.path, newPath);
+      refreshAllVisibleDirectories();
+      if (selectedFile?.path === entry.path) {
+        setSelectedPaths([newPath]);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function startBulkRenaming(paths: string[]) {
+    const targets = flatOrder.filter((entry) => paths.includes(entry.path));
+    if (targets.length < 2) return;
+    setBulkRenameEntries(targets);
+    setBulkPattern("");
+    setBulkStartNumber(1);
+    setBulkOverrides({});
+  }
+
+  function cancelBulkRenaming() {
+    setBulkRenameEntries(null);
+    setBulkOverrides({});
+  }
+
+  function bulkPatternNameFor(entry: DirEntryInfo, index: number): string {
+    const dot = entry.is_dir ? -1 : entry.name.lastIndexOf(".");
+    const ext = dot > 0 ? entry.name.slice(dot) : "";
+    const number = String(bulkStartNumber + index);
+    const base = bulkPattern.includes("{n}")
+      ? bulkPattern.split("{n}").join(number)
+      : `${bulkPattern}${number}`;
+    return `${base}${ext}`;
+  }
+
+  function bulkNameFor(entry: DirEntryInfo, index: number): string {
+    return bulkOverrides[entry.path] ?? bulkPatternNameFor(entry, index);
+  }
+
+  function isBulkRenameValid(): boolean {
+    if (!bulkRenameEntries) return false;
+    const names = bulkRenameEntries.map((entry, index) => bulkNameFor(entry, index).trim());
+    return names.every((name) => name.length > 0) && new Set(names).size === names.length;
+  }
+
+  async function confirmBulkRenaming() {
+    if (!bulkRenameEntries || !currentPath) return;
+    setBulkSaving(true);
+    for (const [index, entry] of bulkRenameEntries.entries()) {
+      const trimmed = bulkNameFor(entry, index).trim();
+      if (!trimmed || trimmed === entry.name) continue;
+      const newPath = joinPath(currentPath, trimmed);
+      try {
+        await rename(entry.path, newPath);
+      } catch (e) {
+        setError(String(e));
+      }
+    }
+    setBulkSaving(false);
+    setBulkRenameEntries(null);
+    setBulkOverrides({});
+    setSelectedPaths([]);
+    refreshAllVisibleDirectories();
+  }
+
+  function requestDelete(paths: string[]) {
+    if (paths.length === 0) return;
+    setDeleteConfirmation({ paths });
+  }
+
+  async function confirmDelete() {
+    if (!deleteConfirmation) return;
+    const { paths } = deleteConfirmation;
+    setDeleteConfirmation(null);
+    for (const path of paths) {
+      try {
+        await remove(path, { recursive: true });
+      } catch (e) {
+        setError(String(e));
+      }
+    }
+    refreshAllVisibleDirectories();
+    setSelectedPaths((prev) => prev.filter((path) => !paths.includes(path)));
+    if (selectedFile && paths.includes(selectedFile.path)) {
+      setSelectedFile(null);
+      setFileContent(null);
+      setEditedContent("");
+      setPreviewFullscreen(false);
+      clearPdfPreview();
+      clearAudioPreview();
+      clearVideoPreview();
+      clearImagePreview();
+    }
+  }
+
+  function uniqueNameFor(baseName: string, suffix: string): string {
+    const existingNames = new Set(entries.map((e) => e.name.toLowerCase()));
+    let name = `${baseName}${suffix}`;
+    let counter = 2;
+    while (existingNames.has(name.toLowerCase())) {
+      name = `${baseName} (${counter})${suffix}`;
+      counter++;
+    }
+    return name;
+  }
+
+  async function createTextFile() {
+    if (!currentPath) return;
+    const name = uniqueNameFor(t("newTextFile"), ".txt");
+    try {
+      const path = joinPath(currentPath, name);
+      await writeTextFile(path, "");
+      const result = await loadDirectory(currentPath, { silent: true });
+      const created = result?.find((e) => e.path === path);
+      if (created) {
+        setSelectedPaths([created.path]);
+        selectionAnchorRef.current = created.path;
+        startRenaming(created);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function createFolder() {
+    if (!currentPath) return;
+    const name = uniqueNameFor(t("newFolder"), "");
+    try {
+      const path = joinPath(currentPath, name);
+      await mkdir(path);
+      const result = await loadDirectory(currentPath, { silent: true });
+      const created = result?.find((e) => e.path === path);
+      if (created) {
+        setSelectedPaths([created.path]);
+        selectionAnchorRef.current = created.path;
+        startRenaming(created);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function moveEntryTo(sourcePath: string, targetDirPath: string) {
+    if (sourcePath === targetDirPath) return;
+    const destPath = joinPath(targetDirPath, basenameOf(sourcePath));
+    if (destPath === sourcePath) return;
+    try {
+      await rename(sourcePath, destPath);
+      refreshAllVisibleDirectories();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function startDraggingEntry(e: ReactDragEvent, entry: DirEntryInfo) {
+    e.dataTransfer.setData(FILE_MOVE_DRAG_TYPE, entry.path);
+    if (entry.is_dir) {
+      e.dataTransfer.setData(FAVORITE_FOLDER_DRAG_TYPE, entry.path);
+    }
+    e.dataTransfer.effectAllowed = "move";
+    setIsDraggingFavorite(true);
+  }
+
+  function handleEntryDragOver(e: ReactDragEvent, targetDirPath: string) {
+    if (!e.dataTransfer.types.includes(FILE_MOVE_DRAG_TYPE)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "move";
+    setDropTargetPath(targetDirPath);
+  }
+
+  function handleEntryDragLeave(targetDirPath: string) {
+    setDropTargetPath((prev) => (prev === targetDirPath ? null : prev));
+  }
+
+  function handleEntryDrop(e: ReactDragEvent, targetDirPath: string) {
+    if (!e.dataTransfer.types.includes(FILE_MOVE_DRAG_TYPE)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDropTargetPath(null);
+    setIsDraggingFavorite(false);
+    const sourcePath = e.dataTransfer.getData(FILE_MOVE_DRAG_TYPE);
+    if (sourcePath) void moveEntryTo(sourcePath, targetDirPath);
   }
 
   function startDraggingFolder(e: ReactDragEvent, path: string) {
@@ -892,6 +1182,7 @@ function ExplorerTab({
 
   function endDraggingFavorite() {
     setDropTargetGroupId(null);
+    setDropTargetPath(null);
     setIsDraggingFavorite(false);
   }
 
@@ -1036,11 +1327,14 @@ function ExplorerTab({
               item.type === "folder" ? (
                 <button
                   key={item.id}
-                  className="favorite-dropdown-item"
+                  className={`favorite-dropdown-item${dropTargetPath === item.path ? " drop-target-move" : ""}`}
                   title={item.path}
                   draggable
                   onDragStart={(e) => startDraggingFolder(e, item.path)}
                   onDragEnd={endDraggingFavorite}
+                  onDragOver={(e) => handleEntryDragOver(e, item.path)}
+                  onDragLeave={() => handleEntryDragLeave(item.path)}
+                  onDrop={(e) => handleEntryDrop(e, item.path)}
                   onClick={() => {
                     loadDirectory(item.path);
                     setOpenGroupIds(new Set());
@@ -1080,9 +1374,42 @@ function ExplorerTab({
     );
   }
 
+  function renderParentEntry() {
+    if (!currentPath) return null;
+    const parent = parentPathOf(currentPath);
+    if (!parent) return null;
+    return (
+      <ul>
+        <li className="tree-node">
+          <div
+            className={`tree-entry-row${viewMode === "block" ? " tree-block-tile" : ""}${dropTargetPath === parent ? " drop-target-move" : ""}`}
+            onClick={() => void loadDirectory(parent)}
+            onDoubleClick={() => void loadDirectory(parent)}
+            onDragOver={(e) => handleEntryDragOver(e, parent)}
+            onDragLeave={() => handleEntryDragLeave(parent)}
+            onDrop={(e) => handleEntryDrop(e, parent)}
+            title={parent}
+          >
+            <span className="tree-toggle-spacer" />
+            <span className="icon">📁</span>
+            <span className="name">..</span>
+            {viewMode === "list" && (
+              <>
+                <span className="meta meta-size" />
+                <span className="meta meta-date" />
+                <span className="meta meta-date" />
+              </>
+            )}
+          </div>
+        </li>
+      </ul>
+    );
+  }
+
   function renderFileListContents() {
     return (
       <>
+        {renderParentEntry()}
         {loading && <p className="hint">{t("loading")}</p>}
         {!loading && currentPath && entries.length > 0 && processedEntries.length === 0 && (
           <p className="hint">{t("noResults")}</p>
@@ -1110,17 +1437,28 @@ function ExplorerTab({
     const treeState = treeDirectories[entry.path];
     const blockView = viewMode === "block";
     const colorHex = colorHexFor(fileColors[entry.path]);
+    const isRenaming = renamingPath === entry.path;
     return (
       <li
         className={`tree-node${blockView && depth === 0 && entry.is_dir && expanded ? " expanded-tree-node" : ""}`}
         key={entry.path}
       >
         <div
-          className={`tree-entry-row${blockView && depth === 0 && !expanded ? " tree-block-tile" : ""}${blockView && (expanded || depth > 0) ? " tree-compact-row" : ""}${selectedPaths.includes(entry.path) ? " selected" : ""}`}
-          draggable={entry.is_dir}
-          onDragStart={(e) => startDraggingFolder(e, entry.path)}
+          className={`tree-entry-row${blockView && depth === 0 && !expanded ? " tree-block-tile" : ""}${blockView && (expanded || depth > 0) ? " tree-compact-row" : ""}${selectedPaths.includes(entry.path) ? " selected" : ""}${dropTargetPath === entry.path ? " drop-target-move" : ""}`}
+          draggable={!isRenaming}
+          onDragStart={(e) => startDraggingEntry(e, entry)}
           onDragEnd={endDraggingFavorite}
+          onDragOver={(e) => {
+            if (entry.is_dir) handleEntryDragOver(e, entry.path);
+          }}
+          onDragLeave={() => {
+            if (entry.is_dir) handleEntryDragLeave(entry.path);
+          }}
+          onDrop={(e) => {
+            if (entry.is_dir) handleEntryDrop(e, entry.path);
+          }}
           onClick={(e) => {
+            if (isRenaming) return;
             if (e.shiftKey) {
               const anchor = selectionAnchorRef.current ?? entry.path;
               const anchorIndex = flatOrder.findIndex((item) => item.path === anchor);
@@ -1174,7 +1512,7 @@ function ExplorerTab({
               : [entry.path];
             setSelectedPaths(colorPaths);
             if (entry.is_dir) {
-              openContextMenu(e, directoryMenuFor(entry.path, colorPaths));
+              openContextMenu(e, directoryMenuFor(entry, colorPaths, parentPath));
             } else {
               const items = fileMenuFor(entry, colorPaths, parentPath);
               if (items.length > 0) openContextMenu(e, items);
@@ -1199,7 +1537,32 @@ function ExplorerTab({
           )}
           <span className="icon">{iconFor(entry.is_dir, extensionOf(entry.name))}</span>
           {colorHex && <span className="color-dot" style={{ backgroundColor: colorHex }} />}
-          <span className="name">{entry.name}</span>
+          {isRenaming ? (
+            <input
+              autoFocus
+              className="rename-input"
+              value={entryRenameValue}
+              onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              onFocus={(e) => {
+                const dot = entry.name.lastIndexOf(".");
+                if (!entry.is_dir && dot > 0) {
+                  e.currentTarget.setSelectionRange(0, dot);
+                } else {
+                  e.currentTarget.select();
+                }
+              }}
+              onChange={(e) => setEntryRenameValue(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") void commitRenaming(entry, parentPath ?? currentPath ?? "");
+                if (e.key === "Escape") cancelRenaming();
+              }}
+              onBlur={() => void commitRenaming(entry, parentPath ?? currentPath ?? "")}
+            />
+          ) : (
+            <span className="name">{entry.name}</span>
+          )}
           {viewMode === "list" && (
             <>
               <span className="meta meta-size">{!entry.is_dir ? formatSize(entry.size) : ""}</span>
@@ -1448,6 +1811,44 @@ function ExplorerTab({
           <button className="icon-btn" title={t("chooseFolder")} onClick={pickFolder}>
             📂
           </button>
+          <div className="new-item-menu">
+            <button
+              className="icon-btn"
+              title={t("newItem")}
+              onClick={() => setNewItemMenuOpen((open) => !open)}
+              disabled={!currentPath}
+            >
+              ➕
+            </button>
+            {newItemMenuOpen && (
+              <>
+                <div
+                  className="new-item-menu-overlay"
+                  onClick={() => setNewItemMenuOpen(false)}
+                />
+                <div className="new-item-dropdown">
+                  <button
+                    className="new-item-dropdown-item"
+                    onClick={() => {
+                      setNewItemMenuOpen(false);
+                      void createTextFile();
+                    }}
+                  >
+                    📝 {t("newTextFile")}
+                  </button>
+                  <button
+                    className="new-item-dropdown-item"
+                    onClick={() => {
+                      setNewItemMenuOpen(false);
+                      void createFolder();
+                    }}
+                  >
+                    📁 {t("newFolder")}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
 
         <div className="view-switch">
@@ -1501,11 +1902,14 @@ function ExplorerTab({
           entry.type === "folder" ? (
             <button
               key={entry.id}
-              className="favorite-chip"
+              className={`favorite-chip${dropTargetPath === entry.path ? " drop-target-move" : ""}`}
               title={entry.path}
               draggable
               onDragStart={(e) => startDraggingFolder(e, entry.path)}
               onDragEnd={endDraggingFavorite}
+              onDragOver={(e) => handleEntryDragOver(e, entry.path)}
+              onDragLeave={() => handleEntryDragLeave(entry.path)}
+              onDrop={(e) => handleEntryDrop(e, entry.path)}
               onClick={() => loadDirectory(entry.path)}
               onMouseDown={(e) => {
                 if (e.button !== 1) return;
@@ -1616,7 +2020,16 @@ function ExplorerTab({
       {error && <div className="error">{error}</div>}
 
       <div className="panes">
-        <div className={`file-list view-${viewMode}`}>
+        <div
+          className={`file-list view-${viewMode}`}
+          onContextMenu={(e) => {
+            if (!currentPath) return;
+            openContextMenu(e, [
+              { label: t("newTextFile"), onClick: () => void createTextFile() },
+              { label: t("newFolder"), onClick: () => void createFolder() },
+            ]);
+          }}
+        >
           {viewMode === "list" && (
             <div className="file-list-header tree-entry-row">
               <span className="tree-toggle-spacer" />
@@ -1702,6 +2115,112 @@ function ExplorerTab({
               </button>
               <button type="button" className="primary" onClick={() => answerResumePrompt(true)}>
                 {t("yes")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleteConfirmation && (
+        <div className="modal-backdrop">
+          <div className="resume-prompt">
+            <p>
+              {deleteConfirmation.paths.length === 1
+                ? t("deleteConfirmSingle").replace(
+                    "{name}",
+                    basenameOf(deleteConfirmation.paths[0]),
+                  )
+                : t("deleteConfirmMultiple").replace(
+                    "{count}",
+                    String(deleteConfirmation.paths.length),
+                  )}
+            </p>
+            <div className="resume-prompt-actions">
+              <button type="button" onClick={() => setDeleteConfirmation(null)}>
+                {t("no")}
+              </button>
+              <button type="button" className="primary" onClick={() => void confirmDelete()}>
+                {t("delete")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {bulkRenameEntries && (
+        <div className="modal-backdrop">
+          <div className="bulk-rename-modal">
+            <h3>{t("renameMultiple")}</h3>
+            <div className="bulk-rename-pattern">
+              <label className="control">
+                <span className="control-label">{t("bulkRenameBaseName")}</span>
+                <input
+                  autoFocus
+                  type="text"
+                  placeholder="{n}"
+                  value={bulkPattern}
+                  onChange={(e) => setBulkPattern(e.currentTarget.value)}
+                />
+              </label>
+              <label className="control">
+                <span className="control-label">{t("bulkRenameStartNumber")}</span>
+                <input
+                  type="number"
+                  className="bulk-rename-number-input"
+                  value={bulkStartNumber}
+                  onChange={(e) => setBulkStartNumber(Number(e.currentTarget.value) || 1)}
+                />
+              </label>
+            </div>
+            <p className="bulk-rename-hint">{t("bulkRenamePatternHint")}</p>
+            <ul className="bulk-rename-list">
+              {bulkRenameEntries.map((entry, index) => {
+                const newName = bulkNameFor(entry, index);
+                const overridden = bulkOverrides[entry.path] !== undefined;
+                return (
+                  <li className="bulk-rename-row" key={entry.path}>
+                    <span className="bulk-rename-old" title={entry.name}>
+                      {entry.name}
+                    </span>
+                    <span className="bulk-rename-arrow">→</span>
+                    <input
+                      className="bulk-rename-input"
+                      value={newName}
+                      onChange={(e) => {
+                        const value = e.currentTarget.value;
+                        setBulkOverrides((prev) => ({ ...prev, [entry.path]: value }));
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="bulk-rename-reset"
+                      title={t("bulkRenameReset")}
+                      disabled={!overridden}
+                      onClick={() =>
+                        setBulkOverrides((prev) => {
+                          const next = { ...prev };
+                          delete next[entry.path];
+                          return next;
+                        })
+                      }
+                    >
+                      ↺
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="resume-prompt-actions">
+              <button type="button" onClick={cancelBulkRenaming} disabled={bulkSaving}>
+                {t("no")}
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void confirmBulkRenaming()}
+                disabled={bulkSaving || !isBulkRenameValid()}
+              >
+                {bulkSaving ? t("saving") : t("rename")}
               </button>
             </div>
           </div>
