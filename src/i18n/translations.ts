@@ -73,6 +73,8 @@ export const translations = {
     newTab: "Nova aba",
     closeTab: "Fechar aba",
     openInNewTab: "Abrir em nova aba",
+    saveEdit: "Salvar",
+    saving: "Salvando...",
   },
   en: {
     chooseFolder: "Choose folder",
@@ -146,6 +148,8 @@ export const translations = {
     newTab: "New tab",
     closeTab: "Close tab",
     openInNewTab: "Open in new tab",
+    saveEdit: "Save",
+    saving: "Saving...",
   },
 } satisfies Record<Language, Record<string, string>>;
 

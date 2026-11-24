@@ -11,7 +11,7 @@ import {
 } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { readFile, readTextFile } from "@tauri-apps/plugin-fs";
+import { readFile, readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { useLanguage } from "../i18n/LanguageContext";
 import type { TranslationKey } from "../i18n/translations";
 import { readEnumPreference, readStorage, writeStorage } from "../storage/localStorage";
@@ -237,8 +237,11 @@ function ExplorerTab({
   const [entries, setEntries] = useState<DirEntryInfo[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const selectionAnchorRef = useRef<string | null>(null);
+  const saveTextEditsRef = useRef<() => void>(() => {});
   const [selectedFile, setSelectedFile] = useState<DirEntryInfo | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
+  const [editedContent, setEditedContent] = useState("");
+  const [savingText, setSavingText] = useState(false);
   const [pdfPreviewUrl, setPdfPreviewUrl] = useState<string | null>(null);
   const pdfPreviewUrlRef = useRef<string | null>(null);
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
@@ -539,6 +542,9 @@ function ExplorerTab({
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && !isTextInput) {
         e.preventDefault();
         setSelectedPaths(flatOrder.map((entry) => entry.path));
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        saveTextEditsRef.current();
       } else if (e.altKey && e.key === "ArrowUp") {
         e.preventDefault();
         goUp();
@@ -559,6 +565,7 @@ function ExplorerTab({
     selectionAnchorRef.current = null;
     setSelectedFile(null);
     setFileContent(null);
+    setEditedContent("");
     setDirectorySummary(null);
     setDirectorySummaryLoading(false);
     setDirectorySummaryError(null);
@@ -720,6 +727,20 @@ function ExplorerTab({
     await openEntry(entry);
   }
 
+  async function saveTextEdits() {
+    if (!selectedFile || fileContent === null || editedContent === fileContent) return;
+    setSavingText(true);
+    try {
+      await writeTextFile(selectedFile.path, editedContent);
+      setFileContent(editedContent);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingText(false);
+    }
+  }
+  saveTextEditsRef.current = () => void saveTextEdits();
+
   function handlePanelResizeStart(event: ReactPointerEvent<HTMLDivElement>) {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -745,6 +766,7 @@ function ExplorerTab({
       const requestId = directorySummaryRequest.current;
       setSelectedFile(entry);
       setFileContent(null);
+      setEditedContent("");
       clearPdfPreview();
       clearAudioPreview();
       clearVideoPreview();
@@ -775,6 +797,7 @@ function ExplorerTab({
     directorySummaryRequest.current += 1;
     setSelectedFile(entry);
     setFileContent(null);
+    setEditedContent("");
     const ext = extensionOf(entry.name);
     const category = categoryOf(false, ext);
     clearPdfPreview();
@@ -839,6 +862,7 @@ function ExplorerTab({
     try {
       const content = await readTextFile(entry.path);
       setFileContent(content);
+      setEditedContent(content);
     } catch (e) {
       setError(String(e));
     }
@@ -1274,14 +1298,34 @@ function ExplorerTab({
       );
     }
 
+    if (fileContent === null) {
+      return (
+        <>
+          <h3>{selectedFile.name}</h3>
+          <p className="hint">{t("noPreviewHint")}</p>
+        </>
+      );
+    }
+
+    const isDirty = editedContent !== fileContent;
     return (
       <>
         <h3>{selectedFile.name}</h3>
-        {fileContent !== null ? (
-          <pre>{fileContent}</pre>
-        ) : (
-          <p className="hint">{t("noPreviewHint")}</p>
-        )}
+        <div className="text-edit-toolbar">
+          <button
+            type="button"
+            className="primary"
+            onClick={saveTextEdits}
+            disabled={!isDirty || savingText}
+          >
+            {savingText ? t("saving") : t("saveEdit")}
+          </button>
+        </div>
+        <textarea
+          className="text-edit-textarea"
+          value={editedContent}
+          onChange={(e) => setEditedContent(e.currentTarget.value)}
+        />
       </>
     );
   }
@@ -1330,7 +1374,26 @@ function ExplorerTab({
       );
     }
     if (fileContent !== null) {
-      return <pre className="preview-fullscreen-text">{fileContent}</pre>;
+      const isDirty = editedContent !== fileContent;
+      return (
+        <div className="preview-fullscreen-text-wrap">
+          <div className="text-edit-toolbar preview-fullscreen-text-toolbar">
+            <button
+              type="button"
+              className="primary"
+              onClick={saveTextEdits}
+              disabled={!isDirty || savingText}
+            >
+              {savingText ? t("saving") : t("saveEdit")}
+            </button>
+          </div>
+          <textarea
+            className="preview-fullscreen-textarea"
+            value={editedContent}
+            onChange={(e) => setEditedContent(e.currentTarget.value)}
+          />
+        </div>
+      );
     }
     return null;
   }
@@ -1592,6 +1655,7 @@ function ExplorerTab({
               setSelectedPaths([]);
               setSelectedFile(null);
               setFileContent(null);
+              setEditedContent("");
               clearPdfPreview();
               clearAudioPreview();
               clearVideoPreview();
