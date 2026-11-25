@@ -1623,7 +1623,7 @@ function ExplorerTab({
         <div className="preview-pane">
           <embed
             className="pdf-preview"
-            src={`${pdfPreviewUrl}#toolbar=0&navpanes=0&scrollbar=0`}
+            src={`${pdfPreviewUrl}#toolbar=1&navpanes=0`}
             type="application/pdf"
           />
         </div>
@@ -1698,7 +1698,7 @@ function ExplorerTab({
       return (
         <embed
           className="preview-fullscreen-embed"
-          src={`${pdfPreviewUrl}#toolbar=0&navpanes=0&scrollbar=0`}
+          src={`${pdfPreviewUrl}#toolbar=1&navpanes=0`}
           type="application/pdf"
         />
       );
