@@ -90,6 +90,7 @@ export const translations = {
     newFolder: "Nova pasta",
     deleteConfirmSingle: 'Excluir "{name}"? Esta ação não pode ser desfeita.',
     deleteConfirmMultiple: "Excluir {count} itens selecionados? Esta ação não pode ser desfeita.",
+    dragOutHint: "Segure Alt ao arrastar para outro aplicativo.",
   },
   en: {
     chooseFolder: "Choose folder",
@@ -180,6 +181,7 @@ export const translations = {
     newFolder: "New folder",
     deleteConfirmSingle: 'Delete "{name}"? This action cannot be undone.',
     deleteConfirmMultiple: "Delete {count} selected items? This action cannot be undone.",
+    dragOutHint: "Hold Alt while dragging to another app.",
   },
 } satisfies Record<Language, Record<string, string>>;
 

@@ -314,8 +314,6 @@ function ExplorerTab({
   const [renameValue, setRenameValue] = useState("");
   const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null);
   const [isDraggingFavorite, setIsDraggingFavorite] = useState(false);
-  const pendingExternalDragRef = useRef<string[] | null>(null);
-  const externalDragStartedRef = useRef(false);
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
   const [entryRenameValue, setEntryRenameValue] = useState("");
   const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
@@ -711,22 +709,6 @@ function ExplorerTab({
     bulkRenameEntries,
     deleteConfirmation,
   ]);
-
-  useEffect(() => {
-    function handleWindowDragLeave(e: DragEvent) {
-      if (!pendingExternalDragRef.current || externalDragStartedRef.current) return;
-      // relatedTarget is null only when the drag leaves the whole document
-      // (i.e. the cursor left the app window), as opposed to moving between
-      // elements inside the page, which also fires dragleave but with a
-      // relatedTarget set to the element being entered.
-      if (e.relatedTarget !== null) return;
-      externalDragStartedRef.current = true;
-      const paths = pendingExternalDragRef.current;
-      void startDrag({ item: paths, icon: dragIconUrl, mode: "copy" }).catch(() => {});
-    }
-    window.addEventListener("dragleave", handleWindowDragLeave);
-    return () => window.removeEventListener("dragleave", handleWindowDragLeave);
-  }, []);
 
   async function loadDirectory(
     path: string,
@@ -1327,18 +1309,19 @@ function ExplorerTab({
       selectedPaths.includes(entry.path) && selectedPaths.length > 1
         ? selectedPaths
         : [entry.path];
+    if (e.altKey) {
+      e.preventDefault();
+      void startDrag({ item: paths, icon: dragIconUrl, mode: "copy" }).catch((cause: unknown) => {
+        setError(String(cause));
+      });
+      return;
+    }
     e.dataTransfer.setData(FILE_MOVE_DRAG_TYPE, JSON.stringify(paths));
     if (entry.is_dir && paths.length === 1) {
       e.dataTransfer.setData(FAVORITE_FOLDER_DRAG_TYPE, entry.path);
     }
     e.dataTransfer.effectAllowed = "move";
     setIsDraggingFavorite(true);
-    // Native OS drag-out is deferred until the cursor actually leaves the
-    // window (see the window "dragleave" listener below). Starting it here
-    // unconditionally raced with the browser's own native drag session for
-    // the same gesture, which made internal drag-and-drop behave randomly.
-    pendingExternalDragRef.current = paths;
-    externalDragStartedRef.current = false;
   }
 
   function handleEntryDragOver(e: ReactDragEvent, targetDirPath: string) {
@@ -1387,8 +1370,6 @@ function ExplorerTab({
     setDropTargetGroupId(null);
     setDropTargetPath(null);
     setIsDraggingFavorite(false);
-    pendingExternalDragRef.current = null;
-    externalDragStartedRef.current = false;
   }
 
   function handleGroupDragOver(e: ReactDragEvent, groupId: string) {
@@ -1723,7 +1704,7 @@ function ExplorerTab({
               if (items.length > 0) openContextMenu(e, items);
             }
           }}
-          title={entry.path}
+          title={`${entry.path}\n${t("dragOutHint")}`}
         >
           {entry.is_dir ? (
             <button
