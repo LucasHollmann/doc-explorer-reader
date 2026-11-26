@@ -98,13 +98,50 @@ async fn directory_summary(path: String) -> Result<DirectorySummary, String> {
     .map_err(|error| error.to_string())?
 }
 
+fn copy_recursive(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let dest_path = destination.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_recursive(&entry.path(), &dest_path)?;
+            } else {
+                fs::copy(entry.path(), &dest_path)?;
+            }
+        }
+    } else {
+        fs::copy(source, destination)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn copy_path(source: String, destination: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        copy_recursive(std::path::Path::new(&source), std::path::Path::new(&destination))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .invoke_handler(tauri::generate_handler![read_directory, directory_summary])
+        .invoke_handler(tauri::generate_handler![
+            read_directory,
+            directory_summary,
+            copy_path
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

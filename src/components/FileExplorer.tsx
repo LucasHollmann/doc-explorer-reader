@@ -211,6 +211,12 @@ function createTab(initialPath: string, initialFile?: string): TabMeta {
   return { id: crypto.randomUUID(), title: "", initialPath, initialFile };
 }
 
+type ClipboardState = { paths: string[]; mode: "copy" | "cut" } | null;
+
+type UndoAction =
+  | { type: "rename" | "move"; items: { from: string; to: string }[] }
+  | { type: "copy"; paths: string[] };
+
 type ExplorerTabProps = {
   active: boolean;
   initialPath: string;
@@ -221,6 +227,8 @@ type ExplorerTabProps = {
   setFavorites: Dispatch<SetStateAction<FavoriteEntry[]>>;
   fileColors: FileColors;
   setFileColors: Dispatch<SetStateAction<FileColors>>;
+  clipboard: ClipboardState;
+  setClipboard: Dispatch<SetStateAction<ClipboardState>>;
 };
 
 function ExplorerTab({
@@ -233,6 +241,8 @@ function ExplorerTab({
   setFavorites,
   fileColors,
   setFileColors,
+  clipboard,
+  setClipboard,
 }: ExplorerTabProps) {
   const { t, language, setLanguage } = useLanguage();
   const [viewMode, setViewMode] = useState<ViewMode>(() =>
@@ -308,6 +318,7 @@ function ExplorerTab({
   const [bulkStartNumber, setBulkStartNumber] = useState(1);
   const [bulkOverrides, setBulkOverrides] = useState<Record<string, string>>({});
   const [bulkSaving, setBulkSaving] = useState(false);
+  const [undoStack, setUndoStack] = useState<UndoAction[]>([]);
 
   useEffect(() => writeStorage("viewMode", viewMode), [viewMode]);
   useEffect(() => writeStorage("sortKey", sortKey), [sortKey]);
@@ -617,6 +628,18 @@ function ExplorerTab({
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && !isTextInput) {
         e.preventDefault();
         setSelectedPaths(flatOrder.map((entry) => entry.path));
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && !isTextInput) {
+        e.preventDefault();
+        copySelection();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "x" && !isTextInput) {
+        e.preventDefault();
+        cutSelection();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && !isTextInput) {
+        e.preventDefault();
+        void pasteClipboard();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !isTextInput) {
+        e.preventDefault();
+        void undoLastAction();
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
         saveTextEditsRef.current();
@@ -638,7 +661,7 @@ function ExplorerTab({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentPath, active, flatOrder, selectedPaths]);
+  }, [currentPath, active, flatOrder, selectedPaths, clipboard, undoStack]);
 
   async function loadDirectory(
     path: string,
@@ -985,6 +1008,7 @@ function ExplorerTab({
     const newPath = joinPath(parentPath, trimmed);
     try {
       await rename(entry.path, newPath);
+      pushUndo({ type: "rename", items: [{ from: entry.path, to: newPath }] });
       refreshAllVisibleDirectories();
       if (selectedFile?.path === entry.path) {
         setSelectedPaths([newPath]);
@@ -1031,16 +1055,19 @@ function ExplorerTab({
   async function confirmBulkRenaming() {
     if (!bulkRenameEntries || !currentPath) return;
     setBulkSaving(true);
+    const renamedItems: { from: string; to: string }[] = [];
     for (const [index, entry] of bulkRenameEntries.entries()) {
       const trimmed = bulkNameFor(entry, index).trim();
       if (!trimmed || trimmed === entry.name) continue;
       const newPath = joinPath(currentPath, trimmed);
       try {
         await rename(entry.path, newPath);
+        renamedItems.push({ from: entry.path, to: newPath });
       } catch (e) {
         setError(String(e));
       }
     }
+    if (renamedItems.length > 0) pushUndo({ type: "rename", items: renamedItems });
     setBulkSaving(false);
     setBulkRenameEntries(null);
     setBulkOverrides({});
@@ -1125,21 +1152,107 @@ function ExplorerTab({
     }
   }
 
-  async function moveEntryTo(sourcePath: string, targetDirPath: string) {
-    if (sourcePath === targetDirPath) return;
-    const destPath = joinPath(targetDirPath, basenameOf(sourcePath));
-    if (destPath === sourcePath) return;
-    try {
-      await rename(sourcePath, destPath);
-      refreshAllVisibleDirectories();
-    } catch (e) {
-      setError(String(e));
+  function pushUndo(action: UndoAction) {
+    setUndoStack((prev) => [...prev, action]);
+  }
+
+  async function undoLastAction() {
+    const action = undoStack[undoStack.length - 1];
+    if (!action) return;
+    setUndoStack((prev) => prev.slice(0, -1));
+    if (action.type === "copy") {
+      for (const path of action.paths) {
+        try {
+          await remove(path, { recursive: true });
+        } catch (e) {
+          setError(String(e));
+        }
+      }
+    } else {
+      for (const { from, to } of action.items) {
+        try {
+          await rename(to, from);
+        } catch (e) {
+          setError(String(e));
+        }
+      }
     }
+    refreshAllVisibleDirectories();
+  }
+
+  async function moveEntriesTo(sourcePaths: string[], targetDirPath: string) {
+    const movedItems: { from: string; to: string }[] = [];
+    for (const sourcePath of sourcePaths) {
+      if (sourcePath === targetDirPath) continue;
+      const destPath = joinPath(targetDirPath, basenameOf(sourcePath));
+      if (destPath === sourcePath) continue;
+      try {
+        await rename(sourcePath, destPath);
+        movedItems.push({ from: sourcePath, to: destPath });
+      } catch (e) {
+        setError(String(e));
+      }
+    }
+    if (movedItems.length > 0) pushUndo({ type: "move", items: movedItems });
+    refreshAllVisibleDirectories();
+  }
+
+  function uniqueCopyNameFor(name: string): string {
+    const existingNames = new Set(entries.map((e) => e.name.toLowerCase()));
+    if (!existingNames.has(name.toLowerCase())) return name;
+    const dot = name.lastIndexOf(".");
+    const base = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    let counter = 2;
+    let candidate = `${base} (${counter})${ext}`;
+    while (existingNames.has(candidate.toLowerCase())) {
+      counter++;
+      candidate = `${base} (${counter})${ext}`;
+    }
+    return candidate;
+  }
+
+  function copySelection() {
+    if (selectedPaths.length === 0) return;
+    setClipboard({ paths: selectedPaths, mode: "copy" });
+  }
+
+  function cutSelection() {
+    if (selectedPaths.length === 0) return;
+    setClipboard({ paths: selectedPaths, mode: "cut" });
+  }
+
+  async function pasteClipboard() {
+    if (!clipboard || !currentPath) return;
+    const { paths, mode } = clipboard;
+    if (mode === "cut") {
+      await moveEntriesTo(paths, currentPath);
+      setClipboard(null);
+      return;
+    }
+    const createdPaths: string[] = [];
+    for (const sourcePath of paths) {
+      const destName = uniqueCopyNameFor(basenameOf(sourcePath));
+      const destPath = joinPath(currentPath, destName);
+      if (destPath === sourcePath) continue;
+      try {
+        await invoke("copy_path", { source: sourcePath, destination: destPath });
+        createdPaths.push(destPath);
+      } catch (e) {
+        setError(String(e));
+      }
+    }
+    if (createdPaths.length > 0) pushUndo({ type: "copy", paths: createdPaths });
+    refreshAllVisibleDirectories();
   }
 
   function startDraggingEntry(e: ReactDragEvent, entry: DirEntryInfo) {
-    e.dataTransfer.setData(FILE_MOVE_DRAG_TYPE, entry.path);
-    if (entry.is_dir) {
+    const paths =
+      selectedPaths.includes(entry.path) && selectedPaths.length > 1
+        ? selectedPaths
+        : [entry.path];
+    e.dataTransfer.setData(FILE_MOVE_DRAG_TYPE, JSON.stringify(paths));
+    if (entry.is_dir && paths.length === 1) {
       e.dataTransfer.setData(FAVORITE_FOLDER_DRAG_TYPE, entry.path);
     }
     e.dataTransfer.effectAllowed = "move";
@@ -1164,8 +1277,16 @@ function ExplorerTab({
     e.stopPropagation();
     setDropTargetPath(null);
     setIsDraggingFavorite(false);
-    const sourcePath = e.dataTransfer.getData(FILE_MOVE_DRAG_TYPE);
-    if (sourcePath) void moveEntryTo(sourcePath, targetDirPath);
+    const raw = e.dataTransfer.getData(FILE_MOVE_DRAG_TYPE);
+    if (!raw) return;
+    let paths: string[];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      paths = Array.isArray(parsed) ? parsed : [raw];
+    } catch {
+      paths = [raw];
+    }
+    void moveEntriesTo(paths, targetDirPath);
   }
 
   function startDraggingFolder(e: ReactDragEvent, path: string) {
@@ -2240,6 +2361,7 @@ function FileExplorer() {
   const [fileColors, setFileColors] = useState<FileColors>(() =>
     readStorage<FileColors>("fileColors", {}),
   );
+  const [clipboard, setClipboard] = useState<ClipboardState>(null);
   useEffect(() => writeStorage("favorites", favorites), [favorites]);
   useEffect(() => writeStorage("fileColors", fileColors), [fileColors]);
 
@@ -2360,6 +2482,8 @@ function FileExplorer() {
             setFavorites={setFavorites}
             fileColors={fileColors}
             setFileColors={setFileColors}
+            clipboard={clipboard}
+            setClipboard={setClipboard}
           />
         ))}
       </div>
