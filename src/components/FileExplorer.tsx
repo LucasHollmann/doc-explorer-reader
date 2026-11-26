@@ -13,6 +13,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { mkdir, readFile, readTextFile, remove, rename, writeTextFile } from "@tauri-apps/plugin-fs";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
+import { openPath } from "@tauri-apps/plugin-opener";
 import dragIconUrl from "../assets/drag-icon.png";
 import { useLanguage } from "../i18n/LanguageContext";
 import type { TranslationKey } from "../i18n/translations";
@@ -465,6 +466,10 @@ function ExplorerTab({
     items.push({
       label: t("openInNewTab"),
       onClick: () => onOpenInNewTab(parentPath ?? currentPath ?? "", entry.path),
+    });
+    items.push({
+      label: t("openExternally"),
+      onClick: () => void openFilesExternally(colorPaths),
     });
     if (colorPaths.length === 1 && parentPath) {
       items.push({ label: t("rename"), onClick: () => startRenaming(entry) });
@@ -1212,6 +1217,16 @@ function ExplorerTab({
       candidate = `${base} (${counter})${ext}`;
     }
     return candidate;
+  }
+
+  async function openFilesExternally(paths: string[]) {
+    for (const path of paths) {
+      try {
+        await openPath(path);
+      } catch (e) {
+        setError(String(e));
+      }
+    }
   }
 
   function copySelection() {
