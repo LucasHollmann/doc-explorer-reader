@@ -12,6 +12,8 @@ import {
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { mkdir, readFile, readTextFile, remove, rename, writeTextFile } from "@tauri-apps/plugin-fs";
+import { startDrag } from "@crabnebula/tauri-plugin-drag";
+import dragIconUrl from "../assets/drag-icon.png";
 import { useLanguage } from "../i18n/LanguageContext";
 import type { TranslationKey } from "../i18n/translations";
 import { readEnumPreference, readStorage, writeStorage } from "../storage/localStorage";
@@ -1257,6 +1259,7 @@ function ExplorerTab({
     }
     e.dataTransfer.effectAllowed = "move";
     setIsDraggingFavorite(true);
+    void startDrag({ item: paths, icon: dragIconUrl, mode: "copy" }).catch(() => {});
   }
 
   function handleEntryDragOver(e: ReactDragEvent, targetDirPath: string) {

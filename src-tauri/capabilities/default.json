@@ -14,6 +14,7 @@
     "fs:allow-rename",
     "fs:allow-remove",
     "fs:allow-mkdir",
+    "drag:default",
     {
       "identifier": "fs:scope",
       "allow": [{ "path": "**" }]
