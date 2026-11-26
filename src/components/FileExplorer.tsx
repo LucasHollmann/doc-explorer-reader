@@ -290,6 +290,8 @@ function ExplorerTab({
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const pathInputRef = useRef<HTMLInputElement | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchCaseSensitive, setSearchCaseSensitive] = useState(false);
+  const [searchIgnoreSpecialChars, setSearchIgnoreSpecialChars] = useState(false);
   const [extensionFilter, setExtensionFilter] = useState("");
   const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
   const [newItemMenuOpen, setNewItemMenuOpen] = useState(false);
@@ -548,17 +550,33 @@ function ExplorerTab({
   }
 
   const processedEntries = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
+    const normalizeForSearch = (value: string) => {
+      let result = searchCaseSensitive ? value : value.toLowerCase();
+      if (searchIgnoreSpecialChars) {
+        result = result.replace(/[^a-zA-Z0-9]+/g, "");
+      }
+      return result;
+    };
+    const query = normalizeForSearch(searchQuery.trim());
     const extension = extensionFilter.trim().replace(/^\.+/, "").toLowerCase();
     const filtered = entries.filter((entry) => {
       if (typeFilter === "folders" && !entry.is_dir) return false;
       if (typeFilter === "files" && entry.is_dir) return false;
-      if (query && !entry.name.toLowerCase().includes(query)) return false;
+      if (query && !normalizeForSearch(entry.name).includes(query)) return false;
       if (extension && (entry.is_dir || extensionOf(entry.name) !== extension)) return false;
       return true;
     });
     return [...filtered].sort((a, b) => compareEntries(a, b, sortKey, sortDir));
-  }, [entries, searchQuery, extensionFilter, typeFilter, sortKey, sortDir]);
+  }, [
+    entries,
+    searchQuery,
+    searchCaseSensitive,
+    searchIgnoreSpecialChars,
+    extensionFilter,
+    typeFilter,
+    sortKey,
+    sortDir,
+  ]);
 
   const groupedEntries = useMemo(() => {
     if (groupBy !== "type") return [];
@@ -664,11 +682,33 @@ function ExplorerTab({
       } else if (e.altKey && e.key === "ArrowUp") {
         e.preventDefault();
         goUp();
+      } else if (
+        !isTextInput &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !bulkRenameEntries &&
+        !deleteConfirmation &&
+        currentPath &&
+        /^[a-zA-Z0-9]$/.test(e.key)
+      ) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        setSearchQuery((prev) => prev + e.key);
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentPath, active, flatOrder, selectedPaths, clipboard, undoStack]);
+  }, [
+    currentPath,
+    active,
+    flatOrder,
+    selectedPaths,
+    clipboard,
+    undoStack,
+    bulkRenameEntries,
+    deleteConfirmation,
+  ]);
 
   async function loadDirectory(
     path: string,
@@ -677,6 +717,7 @@ function ExplorerTab({
     directorySummaryRequest.current += 1;
     setLoading(true);
     if (!options?.silent) setError(null);
+    setSearchQuery("");
     setSelectedPaths([]);
     selectionAnchorRef.current = null;
     setSelectedFile(null);
@@ -2150,6 +2191,22 @@ function ExplorerTab({
                   placeholder="pdf"
                   onChange={(e) => setExtensionFilter(e.currentTarget.value)}
                 />
+              </label>
+              <label className="control control-checkbox">
+                <input
+                  type="checkbox"
+                  checked={searchCaseSensitive}
+                  onChange={(e) => setSearchCaseSensitive(e.currentTarget.checked)}
+                />
+                <span className="control-label">{t("searchCaseSensitive")}</span>
+              </label>
+              <label className="control control-checkbox">
+                <input
+                  type="checkbox"
+                  checked={searchIgnoreSpecialChars}
+                  onChange={(e) => setSearchIgnoreSpecialChars(e.currentTarget.checked)}
+                />
+                <span className="control-label">{t("searchIgnoreSpecialChars")}</span>
               </label>
             </div>
           )}

@@ -424,6 +424,14 @@
   color: var(--text-muted);
 }
 
+.control-checkbox {
+  cursor: pointer;
+}
+
+.control-checkbox input[type="checkbox"] {
+  cursor: pointer;
+}
+
 .control select {
   background: var(--hover-bg);
   color: var(--text);
